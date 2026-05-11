@@ -252,14 +252,25 @@ fn main() {
     let mut _skipped_count = 0usize;
     let mut _skipped_bytes = 0u64;
 
-    if !args.overwrite && mode == CopyMode::LocalToLocal && Path::new(&dst_path).is_dir() {
+    if !args.overwrite && (Path::new(&dst_path).is_dir() || dst_ssh.is_some()) {
         banner("Phase 2b - Incremental check");
-        let (new_copy, new_link_map, sk_count, sk_bytes) =
-            filter_unchanged(&copy_entries, &link_map, Path::new(&dst_path), args.threads);
-        copy_entries = new_copy;
-        link_map = new_link_map;
-        _skipped_count = sk_count;
-        _skipped_bytes = sk_bytes;
+        match mode {
+            CopyMode::LocalToLocal => {
+                let (new_copy, new_link_map, sk_count, sk_bytes) =
+                    filter_unchanged(&copy_entries, &link_map, Path::new(&dst_path), args.threads);
+                copy_entries = new_copy; link_map = new_link_map;
+                _skipped_count = sk_count; _skipped_bytes = sk_bytes;
+            }
+            CopyMode::LocalToRemote => {
+                if let Some(ref ssh) = dst_ssh {
+                    let (new_copy, new_link_map, sk_count, sk_bytes) =
+                        filter_unchanged_remote(ssh, &copy_entries, &link_map, &dst_path);
+                    copy_entries = new_copy; link_map = new_link_map;
+                    _skipped_count = sk_count; _skipped_bytes = sk_bytes;
+                }
+            }
+            _ => {}
+        }
     }
 
     if copy_entries.is_empty() && link_map.is_empty() {
@@ -613,6 +624,68 @@ fn filter_unchanged(
         }
     }
 
+    (need_copy, filtered_links, skipped, skipped_bytes)
+}
+
+fn filter_unchanged_remote(
+    ssh: &SSHConnection,
+    entries: &[FileEntry],
+    link_map: &HashMap<String, dedup::LinkTarget>,
+    remote_root: &str,
+) -> (
+    Vec<FileEntry>,
+    HashMap<String, dedup::LinkTarget>,
+    usize,
+    u64,
+) {
+    eprint!("  Checking remote for existing files...");
+
+    let cmd = format!("find {} -type f -printf \"%s\\t%p\\n\" 2>/dev/null", shq(remote_root));
+    let (stdout, _, rc) = ssh.exec_cmd(&cmd, 60000).unwrap_or_default();
+    if rc != 0 {
+        eprintln!("\r  Could not scan remote — copying all files                  ");
+        return (entries.to_vec(), link_map.clone(), 0, 0);
+    }
+
+    let mut existing: HashMap<String, u64> = HashMap::new();
+    for line in stdout.lines() {
+        if line.is_empty() { continue; }
+        if let Some((sz, path)) = line.split_once('\t') {
+            if let Ok(size) = sz.parse::<u64>() {
+                let rel = path.strip_prefix(remote_root).unwrap_or(path).trim_start_matches('/').to_string();
+                existing.insert(rel, size);
+            }
+        }
+    }
+
+    eprintln!("\r  Remote has {} files                              ", existing.len());
+
+    let mut need_copy = Vec::new();
+    let mut skipped = 0usize;
+    let mut skipped_bytes = 0u64;
+    let mut new_link_map = link_map.clone();
+
+    for entry in entries {
+        match existing.get(&entry.rel) {
+            Some(&size) if size == entry.size => {
+                skipped += 1;
+                skipped_bytes += entry.size;
+            }
+            _ => need_copy.push(entry.clone()),
+        }
+    }
+
+    let mut filtered_links = HashMap::new();
+    for (dup_rel, target) in new_link_map.drain() {
+        if existing.contains_key(&dup_rel) {
+            skipped += 1;
+        } else {
+            filtered_links.insert(dup_rel, target);
+        }
+    }
+
+    eprintln!("  Incremental check: {} to copy, {} skipped ({} saved)",
+        need_copy.len(), skipped, progress::fmt_size(skipped_bytes));
     (need_copy, filtered_links, skipped, skipped_bytes)
 }
 
