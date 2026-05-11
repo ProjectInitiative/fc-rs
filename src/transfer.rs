@@ -38,25 +38,32 @@ pub enum WorkerMsg {
 
 // ── TransferPlanner ──────────────────────────────────────────────────
 
-pub struct TransferPlanner { pub batches: Vec<Vec<FileEntry>> }
+pub struct TransferPlanner { pub jobs: Vec<Vec<FileEntry>> }
 impl TransferPlanner {
-    pub fn new(entries: &[FileEntry], n: usize) -> Self {
-        let limit = SMALL_FILE_THRESHOLD;
+    pub fn new(entries: &[FileEntry], _nworkers: usize) -> Self {
+        let limit = SMALL_FILE_THRESHOLD; // 1 MB
         let mut big = Vec::new(); let mut sml = Vec::new();
         for e in entries { if e.size >= limit { big.push(e.clone()); } else { sml.push(e.clone()); } }
         big.sort_by(|a, b| b.size.cmp(&a.size));
-        let mut b: Vec<Vec<FileEntry>> = (0..n).map(|_| Vec::new()).collect();
-        for (i, e) in big.iter().enumerate() { b[i % n].push(e.clone()); }
-        let mut cur = Vec::new(); let mut sz = 0u64; let cap = 64u64 << 20; let mut wi = 0usize;
-        for e in &sml {
-            if sz + e.size > cap && !cur.is_empty() { b[wi % n].append(&mut cur); sz = 0; wi += 1; }
-            sz += e.size; cur.push(e.clone());
+
+        let cap = 64u64 << 20; // 64 MB per job
+        let mut jobs: Vec<Vec<FileEntry>> = Vec::new();
+
+        // Large files: each becomes its own job (sub-chunked by send_batch)
+        for e in big { jobs.push(vec![e]); }
+
+        // Small files: fill cap-sized batches, each becomes a separate job
+        let mut cur: Vec<FileEntry> = Vec::new(); let mut cur_sz = 0u64;
+        for e in sml {
+            if cur_sz + e.size > cap && !cur.is_empty() {
+                jobs.push(std::mem::take(&mut cur));
+                cur_sz = 0;
+            }
+            cur_sz += e.size; cur.push(e);
         }
-        if !cur.is_empty() { b[wi % n].append(&mut cur); }
-        TransferPlanner { batches: b }
-    }
-    pub fn into_jobs(self) -> Vec<Vec<FileEntry>> {
-        self.batches.into_iter().filter(|b| !b.is_empty()).collect()
+        if !cur.is_empty() { jobs.push(cur); }
+
+        TransferPlanner { jobs }
     }
 }
 
@@ -104,7 +111,6 @@ fn send_batch(
     let mut total_b = 0u64; let mut total_f = 0usize;
     let nchunks = estimate_chunks(batch, MAX_CHUNK);
     let mut pos = 0usize; let mut idx = 0usize;
-    eprintln!("\n  W{} starting batch of {} files ({}), nchunks={}", id, batch.len(), progress::fmt_size(batch.iter().map(|e| e.size).sum()), nchunks);
     while pos < batch.len() {
         let end = next_pos(batch, pos);
         let chunk = &batch[pos..end]; pos = end; idx += 1;
@@ -113,20 +119,13 @@ fn send_batch(
         } else {
             format!("tar xf - --no-same-owner --no-same-permissions -C {}", shq(rroot))
         };
-        match ssh.open_channel() {
-            Ok(mut ch) => {
-                if ch.exec(&cmd).is_err() { eprintln!("\n  W{} exec failed", id); break; }
-                match stream_tar(chunk, ch, cfg.compress_zstd, cfg.zstd_level) {
-                    Ok((mut ch, b)) => {
-                        let _ = ch.eof(); ch.wait_close().ok();
-                        total_b += b; total_f += chunk.len();
-                        eprintln!("\n  W{} chunk {}/{} done ({} bytes)", id, idx, nchunks, b);
-                        let _ = tx.send(WorkerMsg::Chunk { id, bytes: b, done: idx, total: nchunks });
-                    }
-                    Err(e) => { eprintln!("\n  W{} stream_tar error: {}", id, e); break; }
-                }
+        if let Ok(mut ch) = ssh.open_channel() {
+            if ch.exec(&cmd).is_err() { break; }
+            if let Ok((mut ch, b)) = stream_tar(chunk, ch, cfg.compress_zstd, cfg.zstd_level) {
+                let _ = ch.eof(); ch.wait_close().ok();
+                total_b += b; total_f += chunk.len();
+                let _ = tx.send(WorkerMsg::Chunk { id, bytes: b, done: idx, total: nchunks });
             }
-            Err(e) => { eprintln!("\n  W{} open_channel error: {}", id, e); break; }
         }
     }
     (total_b, total_f)
@@ -193,17 +192,17 @@ pub fn copy_remote_parallel(
     _progress: &Progress, config: &TransferConfig,
 ) {
     let planner = TransferPlanner::new(entries, config.workers);
-    let jobs = planner.into_jobs();
+    let jobs = planner.jobs;
     if jobs.is_empty() { return; }
     let (jt, jr) = unbounded();
     let (rt, rr) = unbounded::<WorkerMsg>();
-    for b in jobs { jt.send(b).ok(); }
+    for job in jobs { jt.send(job).ok(); }
     for _ in 0..config.workers { jt.send(Vec::new()).ok(); } // shutdown sentinel
 
-    let rroot = remote_root.to_string(); let spec = spec.clone(); let cfg = config.clone();
+    let rpath = remote_root.to_string(); let spec = spec.clone(); let cfg = config.clone();
     let nw = config.workers;
     let handles: Vec<_> = (0..nw).map(|id| {
-        let (jr, rt, spec, rroot, cfg) = (jr.clone(), rt.clone(), spec.clone(), rroot.clone(), cfg.clone());
+        let (jr, rt, spec, rpath, cfg) = (jr.clone(), rt.clone(), spec.clone(), rpath.clone(), cfg.clone());
         std::thread::spawn(move || {
             let mut total = (0u64, 0usize);
             let mut ssh = SSHConnection::new(spec, false);
@@ -212,12 +211,12 @@ pub fn copy_remote_parallel(
                 let _ = rt.send(WorkerMsg::Done { id, bytes: 0, files: 0 });
                 return;
             }
-            ssh.exec_cmd(&format!("mkdir -p {}", shq(&rroot)), 30000).ok();
+            let _ = ssh.mkdir_p(&rpath);
             loop {
                 match jr.recv() {
                     Ok(b) if b.is_empty() => break,
                     Ok(b) => {
-                        let r = send_batch(&b, &mut ssh, &rroot, &cfg, id, &rt);
+                        let r = send_batch(&b, &mut ssh, &rpath, &cfg, id, &rt);
                         total.0 += r.0; total.1 += r.1;
                     }
                     Err(_) => break,

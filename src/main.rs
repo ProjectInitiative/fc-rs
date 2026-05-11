@@ -360,7 +360,7 @@ fn main() {
 
         CopyMode::LocalToRemote => {
             if let Some(ref mut ssh) = dst_ssh {
-                let _ = ssh.exec_cmd(&format!("mkdir -p {}", shq(&dst_path)), 30000);
+                let _ = ssh.mkdir_p(&dst_path);
                 let progress = Progress::new(unique_size, copy_entries.len());
                 let t0 = Instant::now();
 
@@ -478,9 +478,7 @@ fn main() {
             if let (Some(ref src_spec), Some(ref dst_spec)) =
                 (src_remote.as_ref(), dst_remote.as_ref())
             {
-                let _ = dst_ssh
-                    .as_ref()
-                    .map(|s| s.exec_cmd(&format!("mkdir -p {}", shq(&dst_path)), 30000));
+                if let Some(ref mut s) = dst_ssh { let _ = s.mkdir_p(&dst_path); }
                 let progress = Progress::new(unique_size, copy_entries.len());
                 let t0 = Instant::now();
 
@@ -503,8 +501,7 @@ fn main() {
                 } else if let (Some(ref mut src_ssh_val), Some(ref mut dst_ssh_val)) =
                     (&mut src_ssh, &mut dst_ssh)
                 {
-                    let _ = dst_ssh_val
-                        .exec_cmd(&format!("mkdir -p {}", shq(&dst_path)), 30000);
+                    let _ = dst_ssh_val.mkdir_p(&dst_path);
                     copy_hybrid_r2r(
                         &copy_entries,
                         src_ssh_val,
@@ -923,11 +920,12 @@ fn copy_individual_r2r(
             .to_string_lossy()
             .to_string();
         if !dst_dir.is_empty() {
-            let _ = dst_ssh.exec_cmd(&format!("mkdir -p {}", shq(&dst_dir)), 10000);
+            let _ = dst_ssh.mkdir_p(&dst_dir);
         }
 
         if entry.size == 0 {
-            let _ = dst_ssh.exec_cmd(&format!("touch {}", shq(&remote_dst)), 10000);
+            let cmd = format!("touch {}", shq(&remote_dst));
+            let _ = dst_ssh.exec_cmd(&cmd, 10000);
             progress.update(0, 1);
             progress.display();
             continue;

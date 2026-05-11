@@ -113,6 +113,26 @@ impl SSHConnection {
         Ok(self.sftp.as_mut().unwrap())
     }
 
+    pub fn mkdir_p(&mut self, path: &str) -> Result<(), String> {
+        use std::path::Path;
+        let sftp = self.open_sftp()?;
+        let target = Path::new(path);
+        let mut to_create: Vec<&Path> = Vec::new();
+        let mut p = target;
+        loop {
+            if sftp.stat(p).is_ok() { break; }
+            to_create.push(p);
+            match p.parent() {
+                Some(parent) if parent != p => p = parent,
+                _ => break,
+            }
+        }
+        for d in to_create.iter().rev() {
+            sftp.mkdir(d, 0o755).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
     pub fn open_channel(&self) -> Result<ssh2::Channel, String> {
         let session = self.session.as_ref().ok_or("Not connected")?;
         let channel = session.channel_session().map_err(|e| e.to_string())?;
