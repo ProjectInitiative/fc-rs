@@ -78,11 +78,10 @@
         devShells.default = pkgs.mkShell {
           inputsFrom = [ self.packages.${system}.default ];
           packages = with pkgs; [
-            toolchain cargo-edit cargo-watch rust-analyzer
-            pkg-config openssl libssh2 zlib
+            toolchain cargo-edit cargo-watch rust-analyzer pkg-config
+            openssl libssh2 zlib
           ];
           shellHook = ''
-            export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath (with pkgs; [ openssl libssh2 zlib ])}:$LD_LIBRARY_PATH
             export PKG_CONFIG_PATH=${pkgs.openssl.dev}/lib/pkgconfig:$PKG_CONFIG_PATH
             echo "Rust dev environment (crane)"
             echo "Commands: cargo build, cargo test -- --test-threads=1, cargo fmt"
