@@ -371,12 +371,16 @@ fn main() {
                         zstd_level: 3,
                         buf_size,
                     };
+                    let ssh_shared = std::sync::Arc::new(std::sync::Mutex::new(
+                        // Take ownership; the Arc stays alive for all workers
+                        std::mem::take(ssh),
+                    ));
                     fc_rs::transfer::copy_remote_parallel(
                         &copy_entries,
-                        &ssh.spec,
                         &dst_path,
                         &progress,
                         &cfg,
+                        ssh_shared,
                     );
                 } else {
                     copy_hybrid_remote(&copy_entries, ssh, &dst_path, &progress, buf_size);

@@ -1,6 +1,5 @@
 use std::io::Read;
 use std::path::Path;
-
 use ssh2::{Session, Sftp};
 
 use crate::types::RemoteSpec;
@@ -13,16 +12,21 @@ pub struct SSHConnection {
     compress: bool,
 }
 
-impl SSHConnection {
-    pub fn new(spec: RemoteSpec, compress: bool) -> Self {
+impl Default for SSHConnection {
+    fn default() -> Self {
         SSHConnection {
-            spec,
-            session: None,
-            sftp: None,
-            caps: Vec::new(),
-            compress,
+            spec: RemoteSpec { user: String::new(), host: String::new(), port: 22, path: String::new() },
+            session: None, sftp: None, caps: Vec::new(), compress: false,
         }
     }
+}
+
+impl SSHConnection {
+    pub fn new(spec: RemoteSpec, compress: bool) -> Self {
+        SSHConnection { spec, session: None, sftp: None, caps: Vec::new(), compress }
+    }
+
+
 
     pub fn connect(&mut self) -> Result<(), String> {
         let tcp = std::net::TcpStream::connect(format!("{}:{}", self.spec.host, self.spec.port))
