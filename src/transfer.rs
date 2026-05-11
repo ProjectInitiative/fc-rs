@@ -1,4 +1,7 @@
+use std::borrow::Cow;
 use std::fs::File;
+
+fn shq(s: &str) -> Cow<'_, str> { shlex::try_quote(s).unwrap_or(Cow::Borrowed(s)) }
 use std::io::{Read, Write};
 use std::path::Path;
 use std::time::Instant;
@@ -54,27 +57,29 @@ fn push_file(
     let remote = format!("{}/{}", rpath, entry.rel);
     if let Some(p) = Path::new(&remote).parent() { let _ = ssh.mkdir_p(&p.to_string_lossy()); }
     let nchunks = ((entry.size + CHUNK - 1) / CHUNK) as usize;
-    let sftp = match ssh.open_sftp() {
-        Ok(s) => s, Err(e) => { eprintln!("\n  W{} sftp open: {}", id, e); return; }
+
+    // Use raw SSH exec channel instead of SFTP for data — avoids 32 KB SFTP packet limit
+    let cmd = format!("cat > {}", shq(&remote));
+    let mut channel = match ssh.open_channel() {
+        Ok(c) => c, Err(e) => { eprintln!("\n  W{} channel: {}", id, e); return; }
     };
-    match sftp.create(&Path::new(&remote)) {
-        Ok(mut rf) => {
-            match File::open(&entry.src) {
-                Ok(mut lf) => {
-                    let mut buf = vec![0u8; CHUNK as usize];
-                    let mut idx = 0usize;
-                    loop {
-                        let n = match lf.read(&mut buf) { Ok(0) => break, Ok(n) => n, Err(_) => break };
-                        if rf.write_all(&buf[..n]).is_err() { break; }
-                        idx += 1;
-                        let _ = rt.send(WorkerMsg::Chunk { id, bytes: n as u64, done: idx, total: nchunks });
-                    }
-                }
-                Err(e) => eprintln!("\n  W{} open local {}: {}", id, entry.src, e),
+    if channel.exec(&cmd).is_err() { return; }
+
+    match File::open(&entry.src) {
+        Ok(mut lf) => {
+            let mut buf = vec![0u8; CHUNK as usize];
+            let mut idx = 0usize;
+            loop {
+                let n = match lf.read(&mut buf) { Ok(0) => break, Ok(n) => n, Err(_) => break };
+                if channel.write_all(&buf[..n]).is_err() { break; }
+                idx += 1;
+                let _ = rt.send(WorkerMsg::Chunk { id, bytes: n as u64, done: idx, total: nchunks });
             }
         }
-        Err(e) => eprintln!("\n  W{} create remote {}: {}", id, remote, e),
+        Err(e) => eprintln!("\n  W{} open local {}: {}", id, entry.src, e),
     }
+    let _ = channel.eof();
+    channel.wait_close().ok();
 }
 
 fn pull_file(
@@ -84,20 +89,28 @@ fn pull_file(
     let local = Path::new(dst_root).join(&entry.rel);
     if let Some(p) = local.parent() { let _ = std::fs::create_dir_all(p); }
     let nchunks = ((entry.size + CHUNK - 1) / CHUNK) as usize;
-    if let Ok(sftp) = ssh.open_sftp() {
-        if let Ok(mut rf) = sftp.open(&Path::new(&entry.src)) {
-            if let Ok(mut lf) = File::create(&local) {
-                let mut buf = vec![0u8; CHUNK as usize];
-                let mut idx = 0usize;
-                loop {
-                    let n = match rf.read(&mut buf) { Ok(0) => break, Ok(n) => n, Err(_) => break };
-                    if lf.write_all(&buf[..n]).is_err() { break; }
-                    idx += 1;
-                    let _ = rt.send(WorkerMsg::Chunk { id, bytes: n as u64, done: idx, total: nchunks });
-                }
+
+    let cmd = format!("cat {}", shq(&entry.src));
+    let mut channel = match ssh.open_channel() {
+        Ok(c) => c, Err(e) => { eprintln!("\n  W{} channel: {}", id, e); return; }
+    };
+    if channel.exec(&cmd).is_err() { return; }
+    let _ = channel.eof();
+
+    match File::create(&local) {
+        Ok(mut lf) => {
+            let mut buf = vec![0u8; CHUNK as usize];
+            let mut idx = 0usize;
+            loop {
+                let n = match channel.read(&mut buf) { Ok(0) => break, Ok(n) => n, Err(_) => break };
+                if lf.write_all(&buf[..n]).is_err() { break; }
+                idx += 1;
+                let _ = rt.send(WorkerMsg::Chunk { id, bytes: n as u64, done: idx, total: nchunks });
             }
         }
+        Err(e) => eprintln!("\n  W{} create local {}: {}", id, local.display(), e),
     }
+    channel.wait_close().ok();
 }
 
 // ── Orchestrators ───────────────────────────────────────────────────
