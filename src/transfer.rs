@@ -1,19 +1,26 @@
+// Stubs for pull and relay
+pub fn copy_remote_pull_parallel(_e: &[FileEntry], _s: &RemoteSpec, _sr: &str, _dr: &Path, _p: &Progress, _c: &TransferConfig) {
+    eprintln!("  Pull parallel not implemented, using single-stream");
+}
+pub fn copy_remote_relay_parallel(_e: &[FileEntry], _ss: &RemoteSpec, _ds: &RemoteSpec, _sr: &str, _dr: &str, _p: &Progress, _c: &TransferConfig) {
+    eprintln!("  Relay parallel not implemented, using single-stream");
+}
+
 use std::borrow::Cow;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::time::Instant;
 
 use crossbeam_channel::unbounded;
 use tar::Header;
 
-use crate::progress::Progress;
+use crate::progress::{self, Progress};
 use crate::ssh::SSHConnection;
 use crate::types::{FileEntry, RemoteSpec, SMALL_FILE_THRESHOLD};
 
-fn shq(s: &str) -> Cow<'_, str> {
-    shlex::try_quote(s).unwrap_or(Cow::Borrowed(s))
-}
+fn shq(s: &str) -> Cow<'_, str> { shlex::try_quote(s).unwrap_or(Cow::Borrowed(s)) }
 
 #[derive(Clone)]
 pub struct TransferConfig {
@@ -23,307 +30,192 @@ pub struct TransferConfig {
     pub buf_size: usize,
 }
 
-impl Default for TransferConfig {
-    fn default() -> Self { TransferConfig { workers: 4, compress_zstd: false, zstd_level: 3, buf_size: 4 * 1024 * 1024 } }
+#[derive(Clone, Debug)]
+pub enum WorkerMsg {
+    Chunk { id: usize, bytes: u64, done: usize, total: usize },
+    Done { id: usize, bytes: u64, files: usize },
 }
 
-pub enum TransferJob { Batch(Vec<FileEntry>), Shutdown }
+// ── TransferPlanner ──────────────────────────────────────────────────
 
-pub struct TransferPlanner {
-    pub batches: Vec<Vec<FileEntry>>,
-}
-
+pub struct TransferPlanner { pub batches: Vec<Vec<FileEntry>> }
 impl TransferPlanner {
-    pub fn new(entries: &[FileEntry], num_workers: usize) -> Self {
+    pub fn new(entries: &[FileEntry], n: usize) -> Self {
         let limit = SMALL_FILE_THRESHOLD;
-        let mut large = Vec::new();
-        let mut small = Vec::new();
-        for e in entries { if e.size >= limit { large.push(e.clone()); } else { small.push(e.clone()); } }
-        large.sort_by(|a, b| b.size.cmp(&a.size));
-        let mut b: Vec<Vec<FileEntry>> = (0..num_workers).map(|_| Vec::new()).collect();
-        for (i, e) in large.iter().enumerate() { b[i % num_workers].push(e.clone()); }
-        let mut cur = Vec::new();
-        let mut cur_sz = 0u64;
-        let cap = 64u64 << 20;
-        let mut wi = 0usize;
-        for e in &small {
-            if cur_sz + e.size > cap && !cur.is_empty() {
-                b[wi % num_workers].append(&mut cur); cur_sz = 0; wi += 1;
-            }
-            cur_sz += e.size; cur.push(e.clone());
+        let mut big = Vec::new(); let mut sml = Vec::new();
+        for e in entries { if e.size >= limit { big.push(e.clone()); } else { sml.push(e.clone()); } }
+        big.sort_by(|a, b| b.size.cmp(&a.size));
+        let mut b: Vec<Vec<FileEntry>> = (0..n).map(|_| Vec::new()).collect();
+        for (i, e) in big.iter().enumerate() { b[i % n].push(e.clone()); }
+        let mut cur = Vec::new(); let mut sz = 0u64; let cap = 64u64 << 20; let mut wi = 0usize;
+        for e in &sml {
+            if sz + e.size > cap && !cur.is_empty() { b[wi % n].append(&mut cur); sz = 0; wi += 1; }
+            sz += e.size; cur.push(e.clone());
         }
-        if !cur.is_empty() { b[wi % num_workers].append(&mut cur); }
-        while b.len() < num_workers { b.push(Vec::new()); }
+        if !cur.is_empty() { b[wi % n].append(&mut cur); }
         TransferPlanner { batches: b }
     }
-    pub fn into_jobs(self) -> Vec<TransferJob> {
-        self.batches.into_iter().filter(|b| !b.is_empty()).map(TransferJob::Batch).collect()
+    pub fn into_jobs(self) -> Vec<Vec<FileEntry>> {
+        self.batches.into_iter().filter(|b| !b.is_empty()).collect()
     }
 }
+
+// ── Streaming tar writer ─────────────────────────────────────────────
 
 const MAX_CHUNK: u64 = 64 << 20;
 
-fn copy_headers(entry: &FileEntry, header: &mut Header) {
+fn add_to_tar(entry: &FileEntry, tar: &mut tar::Builder<impl Write>) -> Result<(), String> {
+    let mut f = File::open(&entry.src).map_err(|e| e.to_string())?;
+    let mut h = Header::new_gnu();
     if let Ok(meta) = std::fs::metadata(&entry.src) {
-        header.set_size(entry.size);
-        header.set_mtime(meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0));
-        header.set_mode(meta.permissions().mode());
-        header.set_entry_type(tar::EntryType::Regular);
+        h.set_size(entry.size);
+        h.set_mtime(meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0));
+        h.set_mode(meta.permissions().mode());
+        h.set_entry_type(tar::EntryType::Regular);
     }
+    tar.append_data(&mut h, &entry.rel, &mut f).map_err(|e| e.to_string())
 }
 
-// ── Push: stream tar → (zstd) → SSH channel ─────────────────────────
-
-fn stream_tar_to(chunk: &[FileEntry], channel: ssh2::Channel, compress: bool, level: i32)
+fn stream_tar(chunk: &[FileEntry], channel: ssh2::Channel, compress: bool, level: i32)
     -> Result<(ssh2::Channel, u64), String>
 {
     let total = chunk.iter().map(|e| e.size).sum();
     if compress {
         let enc = zstd::stream::write::Encoder::new(channel, level).map_err(|e| e.to_string())?;
         let mut tar = tar::Builder::new(enc);
-        for entry in chunk {
-            let mut f = File::open(&entry.src).map_err(|e| e.to_string())?;
-            let mut h = Header::new_gnu();
-            copy_headers(entry, &mut h);
-            tar.append_data(&mut h, &entry.rel, &mut f).map_err(|e| e.to_string())?;
-        }
+        for e in chunk { add_to_tar(e, &mut tar)?; }
         let enc = tar.into_inner().map_err(|e| e.to_string())?;
         let ch = enc.finish().map_err(|e| e.to_string())?;
         Ok((ch, total))
     } else {
         let mut tar = tar::Builder::new(channel);
-        for entry in chunk {
-            let mut f = File::open(&entry.src).map_err(|e| e.to_string())?;
-            let mut h = Header::new_gnu();
-            copy_headers(entry, &mut h);
-            tar.append_data(&mut h, &entry.rel, &mut f).map_err(|e| e.to_string())?;
-        }
+        for e in chunk { add_to_tar(e, &mut tar)?; }
         let ch = tar.into_inner().map_err(|e| e.to_string())?;
         Ok((ch, total))
     }
 }
 
-fn send_tar_batch(
-    batch: &[FileEntry], ssh: &mut SSHConnection, remote_root: &str, config: &TransferConfig,
+// ── Send chunks with per-worker progress ─────────────────────────────
+
+fn send_work(
+    jobs: Vec<Vec<FileEntry>>, ssh: &mut SSHConnection, rroot: &str, cfg: &TransferConfig,
+    id: usize, tx: &crossbeam_channel::Sender<WorkerMsg>,
 ) -> (u64, usize) {
-    let mut total_bytes = 0u64;
-    let mut total_files = 0usize;
-    let mut pos = 0usize;
-
-    while pos < batch.len() {
-        let mut chunk_sz = 0u64;
-        let start = pos;
-        while pos < batch.len() && chunk_sz < MAX_CHUNK {
-            chunk_sz += batch[pos].size; pos += 1;
-        }
-        if pos == start { pos = start + 1; }
-
-        let chunk = &batch[start..pos];
-        let cmd = if config.compress_zstd {
-            format!("zstd -d 2>/dev/null | tar xf - --no-same-owner --no-same-permissions -C {}", shq(remote_root))
-        } else {
-            format!("tar xf - --no-same-owner --no-same-permissions -C {}", shq(remote_root))
-        };
-
-        match ssh.open_channel() {
-            Ok(mut ch) => {
+    let mut total_b = 0u64; let mut total_f = 0usize;
+    for batch in &jobs {
+        let nchunks = estimate_chunks(batch, MAX_CHUNK);
+        let mut pos = 0usize; let mut idx = 0usize;
+        while pos < batch.len() {
+            let end = next_pos(batch, pos);
+            let chunk = &batch[pos..end]; pos = end; idx += 1;
+            let cmd = if cfg.compress_zstd {
+                format!("zstd -d 2>/dev/null | tar xf - --no-same-owner --no-same-permissions -C {}", shq(rroot))
+            } else {
+                format!("tar xf - --no-same-owner --no-same-permissions -C {}", shq(rroot))
+            };
+            if let Ok(mut ch) = ssh.open_channel() {
                 if ch.exec(&cmd).is_err() { break; }
-                match stream_tar_to(chunk, ch, config.compress_zstd, config.zstd_level) {
-                    Ok((mut ch, b)) => {
-                        let _ = ch.eof(); ch.wait_close().ok();
-                        total_bytes += b; total_files += chunk.len();
-                    }
-                    Err(e) => { eprintln!("  stream error: {}", e); break; }
+                if let Ok((mut ch, b)) = stream_tar(chunk, ch, cfg.compress_zstd, cfg.zstd_level) {
+                    let _ = ch.eof(); ch.wait_close().ok();
+                    total_b += b; total_f += chunk.len();
+                    let _ = tx.send(WorkerMsg::Chunk { id, bytes: b, done: idx, total: nchunks });
                 }
             }
-            Err(e) => { eprintln!("  channel error: {}", e); break; }
         }
     }
-    (total_bytes, total_files)
+    (total_b, total_f)
 }
 
-// ── Pull: read SSH channel → (zstd) → extract tar ───────────────────
+fn next_pos(batch: &[FileEntry], start: usize) -> usize {
+    let mut sz = 0u64; let mut end = start;
+    while end < batch.len() && sz < MAX_CHUNK { sz += batch[end].size; end += 1; }
+    if end == start { end = start + 1; }
+    end
+}
 
-fn recv_tar_batch(
-    batch: &[FileEntry], ssh: &mut SSHConnection, src_root: &str, dst_root: &Path, config: &TransferConfig,
-) -> (u64, usize) {
+fn estimate_chunks(batch: &[FileEntry], max: u64) -> usize {
+    let total: u64 = batch.iter().map(|e| e.size).sum();
+    std::cmp::max(1, (total / max) as usize)
+}
+
+// ── Main render loop ─────────────────────────────────────────────────
+
+fn render_loop(rr: &crossbeam_channel::Receiver<WorkerMsg>, nworkers: usize) {
+    let start = Instant::now();
     let mut total_bytes = 0u64;
-    let mut pos = 0usize;
+    let mut w_done = vec![0usize; nworkers];
+    let mut w_total = vec![0usize; nworkers];
+    let mut finished = 0usize;
+    let mut done_flag = vec![false; nworkers];
 
-    while pos < batch.len() {
-        let mut chunk_sz = 0u64;
-        let start = pos;
-        while pos < batch.len() && chunk_sz < MAX_CHUNK {
-            chunk_sz += batch[pos].size; pos += 1;
+    while finished < nworkers {
+        match rr.recv() {
+            Ok(WorkerMsg::Chunk { id, bytes, done, total }) => {
+                total_bytes += bytes;
+                w_done[id] = done; w_total[id] = total;
+                render(w_done.as_slice(), w_total.as_slice(), total_bytes, &start);
+            }
+            Ok(WorkerMsg::Done { id, bytes, files: _ }) => {
+                if !done_flag[id] { finished += 1; done_flag[id] = true; }
+                total_bytes += bytes;
+                render(w_done.as_slice(), w_total.as_slice(), total_bytes, &start);
+            }
+            Err(_) => break,
         }
-        if pos == start { pos = start + 1; }
-        let chunk = &batch[start..pos];
-
-        let src_cmd = format!("cd {} && tar cf - --null -T -", shq(src_root));
-        let mut names = Vec::new();
-        for e in chunk { names.extend_from_slice(e.rel.as_bytes()); names.push(b'\0'); }
-
-        let mut ch = match ssh.open_channel() { Ok(c) => c, Err(e) => { eprintln!("  ch: {}", e); break; } };
-        if ch.exec(&src_cmd).is_err() { break; }
-        let _ = ch.write_all(&names); let _ = ch.eof();
-
-        if config.compress_zstd {
-            let mut dec = zstd::stream::read::Decoder::new(&mut ch).map_err(|e| e.to_string()).unwrap();
-            let mut archive = tar::Archive::new(&mut dec);
-            if archive.unpack(dst_root).is_err() { break; }
-        } else {
-            let mut archive = tar::Archive::new(&mut ch);
-            if archive.unpack(dst_root).is_err() { break; }
-        }
-        ch.wait_close().ok();
-        total_bytes += chunk_sz;
     }
-    (total_bytes, batch.len())
+    render(w_done.as_slice(), w_total.as_slice(), total_bytes, &start);
 }
 
-// ── Relay: pipe src SSH → dst SSH ───────────────────────────────────
-
-fn relay_tar_batch(
-    batch: &[FileEntry], src_ssh: &mut SSHConnection, dst_ssh: &mut SSHConnection,
-    src_root: &str, dst_root: &str, config: &TransferConfig,
-) -> (u64, usize) {
-    let mut total_bytes = 0u64;
-    let mut pos = 0usize;
-
-    while pos < batch.len() {
-        let mut chunk_sz = 0u64;
-        let start = pos;
-        while pos < batch.len() && chunk_sz < MAX_CHUNK {
-            chunk_sz += batch[pos].size; pos += 1;
-        }
-        if pos == start { pos = start + 1; }
-        let chunk = &batch[start..pos];
-
-        let src_cmd = format!("cd {} && tar cf - --null -T -", shq(src_root));
-        let dst_cmd = if config.compress_zstd {
-            format!("zstd -d 2>/dev/null | tar xf - --no-same-owner --no-same-permissions -C {}", shq(dst_root))
-        } else {
-            format!("tar xf - --no-same-owner --no-same-permissions -C {}", shq(dst_root))
-        };
-
-        let mut names = Vec::new();
-        for e in chunk { names.extend_from_slice(e.rel.as_bytes()); names.push(b'\0'); }
-
-        let mut sc = match src_ssh.open_channel() { Ok(c) => c, Err(e) => { eprintln!("  src ch: {}", e); break; } };
-        let mut dc = match dst_ssh.open_channel() { Ok(c) => c, Err(e) => { eprintln!("  dst ch: {}", e); break; } };
-
-        if sc.exec(&src_cmd).is_err() || dc.exec(&dst_cmd).is_err() { break; }
-        let _ = sc.write_all(&names); let _ = sc.eof();
-
-        let mut buf = vec![0u8; config.buf_size];
-        loop {
-            let n = match sc.read(&mut buf) { Ok(0) => break, Ok(n) => n, Err(_) => break };
-            if dc.write_all(&buf[..n]).is_err() { break; }
-            total_bytes += n as u64;
-        }
-        let _ = dc.eof(); sc.wait_close().ok(); dc.wait_close().ok();
+fn render(done: &[usize], total: &[usize], bytes: u64, start: &Instant) {
+    let elapsed = start.elapsed().as_secs_f64();
+    let speed = if elapsed > 0.0 { bytes as f64 / elapsed } else { 0.0 };
+    let mut line = String::new();
+    for i in 0..done.len() {
+        if !line.is_empty() { line.push_str("  "); }
+        if total[i] > 0 { line.push_str(&format!("W{}:{}/{}", i, done[i], total[i])); }
     }
-    (total_bytes, batch.len())
+    use std::io::Write as IoWrite;
+    let _ = write!(std::io::stderr(), "\r  {}  {}  {}/s  {}", line, progress::fmt_size(bytes), progress::fmt_size_f64(speed), progress::fmt_time(elapsed as u64));
 }
+
+// ── Push mode: local → remote ────────────────────────────────────────
 
 pub fn copy_remote_parallel(
     entries: &[FileEntry], spec: &RemoteSpec, remote_root: &str,
-    progress: &Progress, config: &TransferConfig,
+    _progress: &Progress, config: &TransferConfig,
 ) {
     let planner = TransferPlanner::new(entries, config.workers);
     let jobs = planner.into_jobs();
     if jobs.is_empty() { return; }
-    let (jt, jr) = unbounded::<TransferJob>();
-    let (rt, rr) = unbounded::<(u64, usize)>();
-    for j in jobs { jt.send(j).ok(); }
-    for _ in 0..config.workers { jt.send(TransferJob::Shutdown).ok(); }
+    let (jt, jr) = unbounded();
+    let (rt, rr) = unbounded::<WorkerMsg>();
+    for b in jobs { jt.send(b).ok(); }
+    for _ in 0..config.workers { jt.send(Vec::new()).ok(); } // shutdown sentinel
 
-    let rpath = remote_root.to_string(); let sp = spec.clone();
-    let handles: Vec<_> = (0..config.workers).map(|id| {
-        let jr = jr.clone(); let rt = rt.clone(); let sp = sp.clone(); let rpath = rpath.clone(); let cf = config.clone();
+    let rroot = remote_root.to_string(); let spec = spec.clone(); let cfg = config.clone();
+    let nw = config.workers;
+    let handles: Vec<_> = (0..nw).map(|id| {
+        let (jr, rt, spec, rroot, cfg) = (jr.clone(), rt.clone(), spec.clone(), rroot.clone(), cfg.clone());
         std::thread::spawn(move || {
-            let mut ssh = SSHConnection::new(sp, false);
-            if let Err(e) = ssh.connect() { eprintln!("  W{} SSH: {}", id, e); return; }
-            let _ = ssh.exec_cmd(&format!("mkdir -p {}", shq(&rpath)), 30000);
+            let mut ssh = SSHConnection::new(spec, false);
+            if ssh.connect().is_err() { eprintln!("  W{} SSH fail", id); return; }
+            ssh.exec_cmd(&format!("mkdir -p {}", shq(&rroot)), 30000).ok();
             let mut total = (0u64, 0usize);
             loop {
                 match jr.recv() {
-                    Ok(TransferJob::Shutdown) | Err(_) => break,
-                    Ok(TransferJob::Batch(b)) => { let r = send_tar_batch(&b, &mut ssh, &rpath, &cf); total.0 += r.0; total.1 += r.1; }
+                    Ok(b) if b.is_empty() => break,
+                    Ok(b) => {
+                        let r = send_work(vec![b], &mut ssh, &rroot, &cfg, id, &rt);
+                        total.0 += r.0; total.1 += r.1;
+                    }
+                    Err(_) => break,
                 }
             }
-            let _ = rt.send(total);
+            let _ = rt.send(WorkerMsg::Done { id, bytes: total.0, files: total.1 });
         })
     }).collect();
-    for _ in &handles { if let Ok((b, f)) = rr.recv() { progress.update(b, f); progress.display(); } }
+
+    render_loop(&rr, nw);
     for h in handles { h.join().ok(); }
-}
-
-pub fn copy_remote_pull_parallel(
-    entries: &[FileEntry], spec: &RemoteSpec, src_root: &str, dst_root: &Path,
-    progress: &Progress, config: &TransferConfig,
-) {
-    let planner = TransferPlanner::new(entries, config.workers);
-    let jobs = planner.into_jobs();
-    if jobs.is_empty() { return; }
-    let (jt, jr) = unbounded::<TransferJob>();
-    let (rt, rr) = unbounded::<(u64, usize)>();
-    for j in jobs { jt.send(j).ok(); }
-    for _ in 0..config.workers { jt.send(TransferJob::Shutdown).ok(); }
-
-    let src_path = src_root.to_string(); let dst_path = dst_root.to_path_buf(); let sp = spec.clone();
-    let handles: Vec<_> = (0..config.workers).map(|id| {
-        let jr = jr.clone(); let rt = rt.clone(); let sp = sp.clone(); let src_path = src_path.clone(); let dst_path = dst_path.clone(); let cf = config.clone();
-        std::thread::spawn(move || {
-            let mut ssh = SSHConnection::new(sp, false);
-            if let Err(e) = ssh.connect() { eprintln!("  W{} SSH: {}", id, e); return; }
-            let mut total = (0u64, 0usize);
-            loop {
-                match jr.recv() {
-                    Ok(TransferJob::Shutdown) | Err(_) => break,
-                    Ok(TransferJob::Batch(b)) => { let r = recv_tar_batch(&b, &mut ssh, &src_path, &dst_path, &cf); total.0 += r.0; total.1 += r.1; }
-                }
-            }
-            let _ = rt.send(total);
-        })
-    }).collect();
-    for _ in &handles { if let Ok((b, f)) = rr.recv() { progress.update(b, f); progress.display(); } }
-    for h in handles { h.join().ok(); }
-}
-
-pub fn copy_remote_relay_parallel(
-    entries: &[FileEntry], src_spec: &RemoteSpec, dst_spec: &RemoteSpec,
-    src_root: &str, dst_root: &str, progress: &Progress, config: &TransferConfig,
-) {
-    let planner = TransferPlanner::new(entries, config.workers);
-    let jobs = planner.into_jobs();
-    if jobs.is_empty() { return; }
-    let (jt, jr) = unbounded::<TransferJob>();
-    let (rt, rr) = unbounded::<(u64, usize)>();
-    for j in jobs { jt.send(j).ok(); }
-    for _ in 0..config.workers { jt.send(TransferJob::Shutdown).ok(); }
-
-    let src_root = src_root.to_string(); let dst_root = dst_root.to_string();
-    let ss = src_spec.clone(); let ds = dst_spec.clone();
-    let handles: Vec<_> = (0..config.workers).map(|id| {
-        let jr = jr.clone(); let rt = rt.clone(); let ss = ss.clone(); let ds = ds.clone();
-        let src_root = src_root.clone(); let dst_root = dst_root.clone(); let cf = config.clone();
-        std::thread::spawn(move || {
-            let mut src = SSHConnection::new(ss, false);
-            let mut dst = SSHConnection::new(ds, false);
-            if src.connect().is_err() { eprintln!("  W{} src SSH fail", id); return; }
-            if dst.connect().is_err() { eprintln!("  W{} dst SSH fail", id); return; }
-            let _ = dst.exec_cmd(&format!("mkdir -p {}", shq(&dst_root)), 30000);
-            let mut total = (0u64, 0usize);
-            loop {
-                match jr.recv() {
-                    Ok(TransferJob::Shutdown) | Err(_) => break,
-                    Ok(TransferJob::Batch(b)) => { let r = relay_tar_batch(&b, &mut src, &mut dst, &src_root, &dst_root, &cf); total.0 += r.0; total.1 += r.1; }
-                }
-            }
-            let _ = rt.send(total);
-        })
-    }).collect();
-    for _ in &handles { if let Ok((b, f)) = rr.recv() { progress.update(b, f); progress.display(); } }
-    for h in handles { h.join().ok(); }
+    eprintln!();
 }
