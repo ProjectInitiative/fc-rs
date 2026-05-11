@@ -72,6 +72,4 @@ pub struct CliArgs {
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub update: Option<String>,
 
-    #[arg(short = 'V', long)]
-    pub version: bool,
 }

@@ -1,6 +1,11 @@
+use std::borrow::Cow;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+
+fn shq(s: &str) -> Cow<'_, str> {
+    shlex::try_quote(s).unwrap_or(Cow::Borrowed(s))
+}
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 
@@ -128,7 +133,7 @@ pub fn copy_remote_parallel(
                     eprintln!("  Worker {}: SSH connect failed: {}", worker_id, e);
                     return;
                 }
-                let _ = ssh.exec_cmd(&format!("mkdir -p {}", shlex::quote(&remote_root)), 30000);
+                let _ = ssh.exec_cmd(&format!("mkdir -p {}", shq(&remote_root)), 30000);
 
                 loop {
                     let job = match job_rx.recv() {
@@ -281,7 +286,7 @@ pub fn copy_remote_relay_parallel(
                     eprintln!("  Worker {}: dest SSH connect failed: {}", worker_id, e);
                     return;
                 }
-                let _ = dst_ssh.exec_cmd(&format!("mkdir -p {}", shlex::quote(&dst_root)), 30000);
+                let _ = dst_ssh.exec_cmd(&format!("mkdir -p {}", shq(&dst_root)), 30000);
 
                 loop {
                     let job = match job_rx.recv() {
@@ -338,12 +343,12 @@ fn send_tar_batch(
     let cmd = if config.compress_zstd {
         format!(
             "zstd -d 2>/dev/null | tar xf - --no-same-owner --no-same-permissions -C {}",
-            shlex::quote(remote_root)
+            shq(remote_root)
         )
     } else {
         format!(
             "tar xf - --no-same-owner --no-same-permissions -C {}",
-            shlex::quote(remote_root)
+            shq(remote_root)
         )
     };
 
@@ -383,13 +388,7 @@ fn recv_tar_batch(
         file_names.push(b'\0');
     }
 
-    let src_cmd = format!("cd {} && tar cf - --null -T -", shlex::quote(src_root));
-
-    let dst_cmd = if config.compress_zstd {
-        "zstd -d 2>/dev/null | tar xf - --no-same-owner --no-same-permissions".to_string()
-    } else {
-        "tar xf - --no-same-owner --no-same-permissions".to_string()
-    };
+    let src_cmd = format!("cd {} && tar cf - --null -T -", shq(src_root));
 
     let mut channel = match ssh.open_channel() {
         Ok(c) => c,
@@ -452,17 +451,17 @@ fn relay_tar_batch(
         file_names.push(b'\0');
     }
 
-    let src_cmd = format!("cd {} && tar cf - --null -T -", shlex::quote(src_root));
+    let src_cmd = format!("cd {} && tar cf - --null -T -", shq(src_root));
 
     let dst_cmd = if config.compress_zstd {
         format!(
             "zstd -d 2>/dev/null | tar xf - --no-same-owner --no-same-permissions -C {}",
-            shlex::quote(dst_root)
+            shq(dst_root)
         )
     } else {
         format!(
             "tar xf - --no-same-owner --no-same-permissions -C {}",
-            shlex::quote(dst_root)
+            shq(dst_root)
         )
     };
 

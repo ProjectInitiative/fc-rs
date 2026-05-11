@@ -9,13 +9,7 @@
   };
 
   outputs =
-    {
-      self,
-      nixpkgs,
-      flake-utils,
-      crane,
-      fenix,
-    }:
+    { self, nixpkgs, flake-utils, crane, fenix }:
     flake-utils.lib.eachDefaultSystem (
       system:
       let
@@ -27,42 +21,26 @@
         commonArgs = {
           src = craneLib.cleanCargoSource ./.;
           nativeBuildInputs = with pkgs; [ pkg-config ];
-          buildInputs = with pkgs; [
-            openssl
-            libssh2
-            zlib
-          ];
+          buildInputs = with pkgs; [ openssl libssh2 zlib ];
         };
 
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
-        fc-rs-unwrapped = craneLib.buildPackage (commonArgs // { inherit cargoArtifacts; });
+        fc-unwrapped = craneLib.buildPackage (commonArgs // { inherit cargoArtifacts; });
 
-        fc-rs =
-          pkgs.runCommand "fc-rs"
-            {
-              nativeBuildInputs = [ pkgs.makeWrapper ];
-              buildInputs = with pkgs; [
-                openssl
-                libssh2
-                zlib
-              ];
-              inherit fc-rs-unwrapped;
-            }
-            ''
-              mkdir -p $out/bin
-              makeWrapper ${fc-rs-unwrapped}/bin/fc-rs $out/bin/fc-rs \
-                --prefix LD_LIBRARY_PATH : ${
-                  pkgs.lib.makeLibraryPath (
-                    with pkgs;
-                    [
-                      openssl
-                      libssh2
-                      zlib
-                    ]
-                  )
-                }
-            '';
+        fc = pkgs.runCommand "fc" {
+          nativeBuildInputs = [ pkgs.makeWrapper ];
+          inherit fc-unwrapped;
+        } ''
+          mkdir -p $out/bin
+          makeWrapper ${fc-unwrapped}/bin/fc $out/bin/fc \
+            --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath (with pkgs; [ openssl libssh2 zlib ])}
+        '';
+
+        fc-tests = craneLib.cargoTest (commonArgs // {
+          inherit cargoArtifacts;
+          cargoTestExtraArgs = "-- --test-threads=1";
+        });
 
         fast-copy-python = pkgs.callPackage ./nix/fast-copy-python.nix {
           fast-copy-src = ./vendor/fast-copy;
@@ -91,53 +69,45 @@
 
         pkgsForTest = import nixpkgs {
           inherit system;
-          overlays = [ (final: prev: { inherit fc-rs fast-copy-python testData; }) ];
+          overlays = [(final: prev: { inherit fc fast-copy-python testData; })];
         };
 
-      in
-      {
-        packages.default = fc-rs;
+      in {
+        packages.default = fc;
 
         devShells.default = pkgs.mkShell {
           inputsFrom = [ self.packages.${system}.default ];
           packages = with pkgs; [
-            toolchain
-            cargo-edit
-            cargo-watch
-            rust-analyzer
-            pkg-config
+            toolchain cargo-edit cargo-watch rust-analyzer
+            pkg-config openssl libssh2 zlib
           ];
           shellHook = ''
+            export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath (with pkgs; [ openssl libssh2 zlib ])}:$LD_LIBRARY_PATH
+            export PKG_CONFIG_PATH=${pkgs.openssl.dev}/lib/pkgconfig:$PKG_CONFIG_PATH
             echo "Rust dev environment (crane)"
-            echo "Commands: cargo build, cargo test, cargo fmt"
+            echo "Commands: cargo build, cargo test -- --test-threads=1, cargo fmt"
+            echo "Binary: ./target/debug/fc"
           '';
         };
 
         checks = {
-          formatting =
-            pkgs.runCommand "check-formatting"
-              {
-                nativeBuildInputs = with pkgs; [
-                  nixfmt
-                  cargo
-                  rustfmt
-                ];
-                src = ./.;
-              }
-              ''
-                cd $src
-                nixfmt --check *.nix
-                cargo fmt --check
-                touch $out
-              '';
+          formatting = pkgs.runCommand "check-formatting" {
+            nativeBuildInputs = with pkgs; [ nixfmt cargo rustfmt ];
+            src = ./.;
+          } ''
+            cd $src
+            nixfmt --check *.nix
+            cargo fmt --check
+            touch $out
+          '';
 
-          tests = self.packages.${system}.default;
+          tests = fc-tests;
 
           integration = pkgsForTest.testers.nixosTest (
             { pkgs, lib, ... }:
             import ./nixos/tests/parity.nix {
               pkgs = pkgsForTest;
-              fc-rs = pkgsForTest.fc-rs;
+              fc-rs = pkgsForTest.fc;
               fast-copy-python = pkgsForTest.fast-copy-python;
               testData = pkgsForTest.testData;
             }
@@ -149,7 +119,7 @@
     )
     // {
       overlays.default = final: prev: {
-        fc-rs = self.packages.${final.system}.default;
+        fc = self.packages.${final.system}.default;
       };
     };
 }

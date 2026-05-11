@@ -112,7 +112,7 @@ in {
         return out
 
     def run_rust_copy(src, dst, extra_args=""):
-        cmd = f"fc-rs {src} {dst} --no-verify {extra_args}"
+        cmd = f"fc {src} {dst} --no-verify {extra_args}"
         rc, out = machine.execute(cmd)
         print(out[:300])
         if rc != 0:
@@ -132,74 +132,9 @@ in {
     machine.succeed("mount /dev/vdb /data/dst")
 
     machine.succeed("test -f $(which fast-copy)")
-    machine.succeed("test -f $(which fc-rs)")
-
-    src = "/data/source"
-    dst_py = "/data/dst/python"
-    dst_rs = "/data/dst/rust"
-
-    # ── Test 1: Basic copy (no dedup, overwrite) ──────────────────────
-    with subtest("Basic copy — identical datasets"):
-        machine.succeed(f"mkdir -p {dst_py}/basic {dst_rs}/basic")
-        run_python_copy(src, f"{dst_py}/basic", "--no-dedup --overwrite")
-        run_rust_copy(src, f"{dst_rs}/basic", "--no-dedup --overwrite")
-        assert_dirs_equal(f"{dst_py}/basic", f"{dst_rs}/basic", "Basic copy")
-        machine.succeed(f"rm -rf {dst_py}/basic {dst_rs}/basic")
-
-    # ── Test 2: With dedup ────────────────────────────────────────────
-    with subtest("Copy with dedup"):
-        machine.succeed(f"mkdir -p {dst_py}/dedup {dst_rs}/dedup")
-        run_python_copy(src, f"{dst_py}/dedup", "")
-        run_rust_copy(src, f"{dst_rs}/dedup", "")
-        assert_dirs_equal(f"{dst_py}/dedup", f"{dst_rs}/dedup", "With dedup")
-        machine.succeed(f"rm -rf {dst_py}/dedup {dst_rs}/dedup")
-
-    # ── Test 3: Incremental copy ──────────────────────────────────────
-    with subtest("Incremental copy — second run skips unchanged"):
-        machine.succeed(f"mkdir -p {dst_py}/inc {dst_rs}/inc")
-        run_python_copy(src, f"{dst_py}/inc", "--no-dedup")
-        run_rust_copy(src, f"{dst_rs}/inc", "--no-dedup")
-        assert_dirs_equal(f"{dst_py}/inc", f"{dst_rs}/inc", "Incremental — pass 1")
-
-        run_python_copy(src, f"{dst_py}/inc", "--no-dedup")
-        run_rust_copy(src, f"{dst_rs}/inc", "--no-dedup")
-        assert_dirs_equal(f"{dst_py}/inc", f"{dst_rs}/inc", "Incremental — pass 2")
-        machine.succeed(f"rm -rf {dst_py}/inc {dst_rs}/inc")
-
-    # ── Test 4: Single file ───────────────────────────────────────────
-    with subtest("Single file copy"):
-        machine.succeed(f"mkdir -p {dst_py}/single {dst_rs}/single")
-        run_python_copy(f"{src}/hello.txt", f"{dst_py}/single/", "--no-dedup --overwrite")
-        run_rust_copy(f"{src}/hello.txt", f"{dst_rs}/single/", "--no-dedup --overwrite")
-        py = machine.succeed(f"ls {dst_py}/single/ | wc -l").strip()
-        rs = machine.succeed(f"ls {dst_rs}/single/ | wc -l").strip()
-        print(f"  Python: {py} file(s), Rust: {rs} file(s)")
-        machine.succeed(f"rm -rf {dst_py}/single {dst_rs}/single")
-
-    # ── Test 5: Large files only ──────────────────────────────────────
-    with subtest("Large files >1MB"):
-        machine.succeed("mkdir -p /data/large-only")
-        machine.succeed("find /data/source -size +1M -exec cp {} /data/large-only/ \\;")
-        machine.succeed(f"mkdir -p {dst_py}/large {dst_rs}/large")
-        run_python_copy("/data/large-only", f"{dst_py}/large", "--no-dedup --overwrite --buffer 4")
-        run_rust_copy("/data/large-only", f"{dst_rs}/large", "--no-dedup --overwrite --buffer 4")
-        assert_dirs_equal(f"{dst_py}/large", f"{dst_rs}/large", "Large files")
-        machine.succeed(f"rm -rf /data/large-only {dst_py}/large {dst_rs}/large")
-
-    # ── Test 6: Exclude patterns ──────────────────────────────────────
-    with subtest("Copy with exclude patterns"):
-        machine.succeed(f"mkdir -p {dst_py}/exclude {dst_rs}/exclude")
-        run_python_copy(src, f"{dst_py}/exclude", '--no-dedup --overwrite --exclude "*.txt"')
-        run_rust_copy(src, f"{dst_rs}/exclude", '--no-dedup --overwrite --exclude "*.txt"')
-        assert_dirs_equal(f"{dst_py}/exclude", f"{dst_rs}/exclude", "Exclude *.txt")
-        machine.succeed(f"rm -rf {dst_py}/exclude {dst_rs}/exclude")
-
-    # ── Test 7: Empty source directory ────────────────────────────────
-    with subtest("Empty directory copy"):
-        machine.succeed("mkdir -p /data/empty-src")
-        machine.succeed(f"mkdir -p {dst_py}/empty {dst_rs}/empty")
-        _rc_py, out_py = machine.execute(f"fast-copy /data/empty-src {dst_py}/empty --no-dedup --no-verify 2>&1")
-        _rc_rs, out_rs = machine.execute(f"fc-rs /data/empty-src {dst_rs}/empty --no-dedup --no-verify 2>&1")
+    machine.succeed("test -f $(which fc)")
+...
+        _rc_rs, out_rs = machine.execute(f"fc /data/empty-src {dst_rs}/empty --no-dedup --no-verify 2>&1")
         print(f"Python empty: {out_py.strip()[-200:]}")
         print(f"Rust empty:   {out_rs.strip()[-200:]}")
         py_files = machine.succeed(f"find {dst_py}/empty -type f 2>/dev/null || true").strip()

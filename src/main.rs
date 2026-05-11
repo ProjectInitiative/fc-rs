@@ -1,7 +1,12 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::time::Instant;
+
+fn shq(s: &str) -> Cow<'_, str> {
+    shlex::try_quote(s).unwrap_or(Cow::Borrowed(s))
+}
 
 use clap::Parser;
 
@@ -17,7 +22,7 @@ use fc_rs::physical_offset;
 use fc_rs::progress::{self, Progress};
 use fc_rs::scanner::scan_source;
 use fc_rs::ssh::SSHConnection;
-use fc_rs::types::{CopyMode, DedupStrategy, FileEntry, RemoteSpec, VERSION};
+use fc_rs::types::{CopyMode, DedupStrategy, FileEntry, RemoteSpec};
 use fc_rs::update;
 use fc_rs::verify::verify_copy;
 
@@ -58,11 +63,6 @@ fn banner(msg: &str) {
 
 fn main() {
     let args = CliArgs::parse();
-
-    if args.version {
-        println!("fc-rs v{}", VERSION);
-        return;
-    }
 
     if args.check_update {
         update::check_for_update();
@@ -347,7 +347,7 @@ fn main() {
 
         CopyMode::LocalToRemote => {
             if let Some(ref mut ssh) = dst_ssh {
-                let _ = ssh.exec_cmd(&format!("mkdir -p {}", shlex::quote(&dst_path)), 30000);
+                let _ = ssh.exec_cmd(&format!("mkdir -p {}", shq(&dst_path)), 30000);
                 let progress = Progress::new(unique_size, copy_entries.len());
                 let t0 = Instant::now();
 
@@ -467,7 +467,7 @@ fn main() {
             {
                 let _ = dst_ssh
                     .as_ref()
-                    .map(|s| s.exec_cmd(&format!("mkdir -p {}", shlex::quote(&dst_path)), 30000));
+                    .map(|s| s.exec_cmd(&format!("mkdir -p {}", shq(&dst_path)), 30000));
                 let progress = Progress::new(unique_size, copy_entries.len());
                 let t0 = Instant::now();
 
@@ -491,7 +491,7 @@ fn main() {
                     (&mut src_ssh, &mut dst_ssh)
                 {
                     let _ = dst_ssh_val
-                        .exec_cmd(&format!("mkdir -p {}", shlex::quote(&dst_path)), 30000);
+                        .exec_cmd(&format!("mkdir -p {}", shq(&dst_path)), 30000);
                     copy_hybrid_r2r(
                         &copy_entries,
                         src_ssh_val,
@@ -530,7 +530,7 @@ fn main() {
 }
 
 fn scan_remote(ssh: &SSHConnection, src_root: &str, _excludes: &ExcludeList) -> Vec<FileEntry> {
-    let clean = shlex::quote(src_root);
+    let clean = shq(src_root);
     let cmd = format!("find {} -type f -printf \"%s\\t%p\\n\" 2>/dev/null || find {} -type f -exec stat -c \"%s %n\" {{}} + 2>/dev/null", clean, clean);
     let (stdout, _, rc) = ssh.exec_cmd(&cmd, 60000).unwrap_or_default();
     if rc != 0 {
@@ -625,7 +625,7 @@ fn verify_copy_remote(
 
     let cmd = format!(
         "find {} -type f -printf \"%s\\t%p\\n\" 2>/dev/null",
-        shlex::quote(remote_root)
+        shq(remote_root)
     );
     let (stdout, _, rc) = ssh.exec_cmd(&cmd, 60000).unwrap_or_default();
 
@@ -700,7 +700,7 @@ fn copy_individual_remote(
         let src_path = Path::new(&entry.src);
 
         if entry.size == 0 {
-            let _ = ssh.exec_cmd(&format!("touch {}", shlex::quote(&remote_path)), 30000);
+            let _ = ssh.exec_cmd(&format!("touch {}", shq(&remote_path)), 30000);
             progress.update(0, 1);
             progress.display();
             continue;
@@ -759,8 +759,8 @@ fn copy_block_stream_remote(
             let _ = ssh.exec_cmd(
                 &format!(
                     "mkdir -p {}/{}",
-                    shlex::quote(remote_root),
-                    shlex::quote(&remote_parent)
+                    shq(remote_root),
+                    shq(&remote_parent)
                 ),
                 10000,
             );
@@ -791,7 +791,7 @@ fn create_links_remote(
             dedup::LinkTarget::Rel(rel) => format!("{}/{}", remote_root, rel),
             dedup::LinkTarget::Abs(abs) => abs.clone(),
         };
-        let _ = ssh.exec_cmd(&format!("ln {}", shlex::quote(&target_path)), 10000);
+        let _ = ssh.exec_cmd(&format!("ln {}", shq(&target_path)), 10000);
     }
     eprintln!(" done");
 }
@@ -910,11 +910,11 @@ fn copy_individual_r2r(
             .to_string_lossy()
             .to_string();
         if !dst_dir.is_empty() {
-            let _ = dst_ssh.exec_cmd(&format!("mkdir -p {}", shlex::quote(&dst_dir)), 10000);
+            let _ = dst_ssh.exec_cmd(&format!("mkdir -p {}", shq(&dst_dir)), 10000);
         }
 
         if entry.size == 0 {
-            let _ = dst_ssh.exec_cmd(&format!("touch {}", shlex::quote(&remote_dst)), 10000);
+            let _ = dst_ssh.exec_cmd(&format!("touch {}", shq(&remote_dst)), 10000);
             progress.update(0, 1);
             progress.display();
             continue;
