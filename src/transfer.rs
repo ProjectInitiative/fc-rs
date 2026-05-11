@@ -22,7 +22,10 @@ const CHUNK: u64 = 64 << 20;
 
 // ── TransferPlanner ──────────────────────────────────────────────────
 
-pub struct TransferPlanner { pub jobs: Vec<Vec<FileEntry>> }
+pub struct TransferPlanner {
+    pub large_jobs: Vec<Vec<FileEntry>>,
+    pub small_jobs: Vec<Vec<FileEntry>>,
+}
 impl TransferPlanner {
     pub fn new(entries: &[FileEntry]) -> Self {
         let mut big = Vec::new(); let mut sml = Vec::new();
@@ -30,15 +33,15 @@ impl TransferPlanner {
             if e.size >= SMALL_FILE_THRESHOLD { big.push(e.clone()); } else { sml.push(e.clone()); }
         }
         big.sort_by(|a, b| b.size.cmp(&a.size));
-        let mut jobs: Vec<Vec<FileEntry>> = Vec::new();
-        for e in big { jobs.push(vec![e]); }
+        let large_jobs: Vec<Vec<FileEntry>> = big.into_iter().map(|e| vec![e]).collect();
         let mut cur = Vec::new(); let mut sz = 0u64;
+        let mut small_jobs = Vec::new();
         for e in sml {
-            if sz + e.size > CHUNK && !cur.is_empty() { jobs.push(std::mem::take(&mut cur)); sz = 0; }
+            if sz + e.size > CHUNK && !cur.is_empty() { small_jobs.push(std::mem::take(&mut cur)); sz = 0; }
             sz += e.size; cur.push(e);
         }
-        if !cur.is_empty() { jobs.push(cur); }
-        TransferPlanner { jobs }
+        if !cur.is_empty() { small_jobs.push(cur); }
+        TransferPlanner { large_jobs, small_jobs }
     }
 }
 
@@ -121,17 +124,41 @@ fn launch(
     entries: &[FileEntry], cfg: &TransferConfig, spec: &RemoteSpec, rpath: String, mkdir: bool,
     process: impl Fn(&[FileEntry], &mut SSHConnection, usize, &crossbeam_channel::Sender<WorkerMsg>, &str) + Clone + Send + 'static,
 ) {
-    let jobs = TransferPlanner::new(entries).jobs;
-    if jobs.is_empty() { return; }
-    let (jt, jr) = unbounded();
+    let planner = TransferPlanner::new(entries);
+    let n_large = planner.large_jobs.len();
+    let n_small = planner.small_jobs.len();
+    if n_large + n_small == 0 { return; }
+
+    // Dedicated large-file workers vs best-effort small-file workers
+    let large_workers = std::cmp::max(1, ((cfg.workers as f64 * 0.6) as usize).min(n_large));
+    let small_workers = cfg.workers - large_workers;
+
+    // Two separate channels — large workers never see small jobs
+    let (ljt, ljr) = unbounded();
+    let (sjt, sjr) = unbounded();
     let (rt, rr) = unbounded::<WorkerMsg>();
-    for j in jobs { jt.send(j).ok(); }
-    for _ in 0..cfg.workers { jt.send(Vec::new()).ok(); }
+    for j in planner.large_jobs { ljt.send(j).ok(); }
+    for j in planner.small_jobs { sjt.send(j).ok(); }
+    for _ in 0..large_workers { ljt.send(Vec::new()).ok(); }
+    for _ in 0..small_workers { sjt.send(Vec::new()).ok(); }
+
     let spec = spec.clone(); let nw = cfg.workers;
-    let handles: Vec<_> = (0..nw).map(|id| {
-        let (jr, rt, spec, rpath, p) = (jr.clone(), rt.clone(), spec.clone(), rpath.clone(), process.clone());
-        std::thread::spawn(move || worker_main(jr, rt, id, spec, rpath, mkdir, p))
-    }).collect();
+    let mut handles = Vec::new();
+
+    // Large-file workers
+    for i in 0..large_workers {
+        let (jr, rt, spec, rp, p) = (ljr.clone(), rt.clone(), spec.clone(), rpath.clone(), process.clone());
+        handles.push(std::thread::spawn(move || worker_main(jr, rt, i, spec, rp, mkdir, p)));
+    }
+    // Small-file workers
+    for i in 0..small_workers {
+        let id = large_workers + i;
+        let (jr, rt, spec, rp, p) = (sjr.clone(), rt.clone(), spec.clone(), rpath.clone(), process.clone());
+        handles.push(std::thread::spawn(move || worker_main(jr, rt, id, spec, rp, mkdir, p)));
+    }
+
+    eprintln!("  {} large workers → {} files, {} small workers → {} tar batches",
+        large_workers, n_large, small_workers, n_small);
     render_loop(&rr, nw);
     for h in handles { h.join().ok(); } eprintln!();
 }
