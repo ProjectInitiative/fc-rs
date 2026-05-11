@@ -93,10 +93,11 @@ pub fn copy_remote_parallel(
             let mut total = (0u64, 0usize);
             loop {
                 let b = match jr.recv() { Ok(b) => b, Err(_) => break };
-                if b.is_empty() { break; }
-                total.0 += b.iter().map(|e| e.size).sum::<u64>();
-                total.1 += b.len();
-                let nchunks = std::cmp::max(1, (b.iter().map(|e| e.size).sum::<u64>() / MAX_CHUNK) as usize);
+        if b.is_empty() { break; }
+        eprintln!("\n  W{} got job: {} files, {}", id, b.len(), progress::fmt_size(b.iter().map(|e| e.size).sum()));
+        total.0 += b.iter().map(|e| e.size).sum::<u64>();
+        total.1 += b.len();
+        let nchunks = std::cmp::max(1, (b.iter().map(|e| e.size).sum::<u64>() / MAX_CHUNK) as usize);
                 let mut pos = 0usize; let mut idx = 0usize;
                 while pos < b.len() {
                     let mut sz = 0u64; let start = pos;
@@ -108,13 +109,17 @@ pub fn copy_remote_parallel(
                     } else {
                         format!("tar xf - --no-same-owner --no-same-permissions -C {}", shq(&rpath))
                     };
-                    if let Ok(mut ch) = ssh.lock().unwrap().open_channel() {
-                        if ch.exec(&cmd).is_ok() {
-                            if let Ok((mut ch, bytes)) = stream_tar(chunk, ch, cfg.compress_zstd, cfg.zstd_level) {
-                                let _ = ch.eof(); ch.wait_close().ok();
-                                let _ = rt.send(WorkerMsg::Chunk { id, bytes, done: idx, total: nchunks });
+                    let ch_result = ssh.lock().unwrap().open_channel();
+                    match ch_result {
+                        Ok(mut ch) => {
+                            if ch.exec(&cmd).is_ok() {
+                                if let Ok((mut ch2, bytes)) = stream_tar(chunk, ch, cfg.compress_zstd, cfg.zstd_level) {
+                                    let _ = ch2.eof(); ch2.wait_close().ok();
+                                    let _ = rt.send(WorkerMsg::Chunk { id, bytes, done: idx, total: nchunks });
+                                }
                             }
                         }
+                        Err(e) => eprintln!("\n  W{} open_channel: {}", id, e),
                     }
                 }
             }
