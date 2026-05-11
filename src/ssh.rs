@@ -1,4 +1,5 @@
 use std::io::Read;
+use std::path::Path;
 
 use ssh2::{Session, Sftp};
 
@@ -34,16 +35,46 @@ impl SSHConnection {
             .handshake()
             .map_err(|e| format!("SSH handshake failed: {}", e))?;
 
-        // Try agent auth first, then password
-        if session.userauth_agent(&self.spec.user).is_err() {
-            let password = rpassword::prompt_password(format!(
+        // Try agent auth, then pubkey, then password
+        let mut authed = session.userauth_agent(&self.spec.user).is_ok();
+
+        if !authed {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+            for keypath in &[
+                format!("{}/.ssh/id_ed25519", home),
+                format!("{}/.ssh/id_ecdsa", home),
+                format!("{}/.ssh/id_rsa", home),
+                format!("{}/.ssh/id_dsa", home),
+            ] {
+                if Path::new(&keypath).exists() {
+                    if session
+                        .userauth_pubkey_file(&self.spec.user, None, Path::new(&keypath), None)
+                        .is_ok()
+                    {
+                        authed = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !authed {
+            match rpassword::prompt_password(format!(
                 "Password for {}@{}: ",
                 self.spec.user, self.spec.host
-            ))
-            .map_err(|e| e.to_string())?;
-            session
-                .userauth_password(&self.spec.user, &password)
-                .map_err(|e| format!("Password auth failed: {}", e))?;
+            )) {
+                Ok(password) => {
+                    authed = session
+                        .userauth_password(&self.spec.user, &password)
+                        .is_ok();
+                }
+                Err(_) => {
+                    return Err(
+                        "SSH auth failed: no agent, no key, and no TTY for password prompt"
+                            .to_string(),
+                    );
+                }
+            }
         }
 
         if !session.authenticated() {

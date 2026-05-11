@@ -131,6 +131,7 @@ pub fn copy_remote_parallel(
                 let mut ssh = SSHConnection::new(spec, false);
                 if let Err(e) = ssh.connect() {
                     eprintln!("  Worker {}: SSH connect failed: {}", worker_id, e);
+                    let _ = result_tx.send((0, 0));
                     return;
                 }
                 let _ = ssh.exec_cmd(&format!("mkdir -p {}", shq(&remote_root)), 30000);
@@ -153,10 +154,16 @@ pub fn copy_remote_parallel(
         })
         .collect();
 
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
     for _ in &workers {
-        if let Ok((b, f)) = result_rx.recv() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() { break; }
+        if let Ok((b, f)) = result_rx.recv_timeout(remaining) {
             progress.update(b, f as usize);
             progress.display();
+        } else {
+            eprintln!("  Worker timeout — some workers may have failed");
+            break;
         }
     }
     for w in workers {
@@ -200,41 +207,46 @@ pub fn copy_remote_pull_parallel(
             let dst_root = dst_root.to_path_buf();
             let cfg = config.clone();
 
-            std::thread::spawn(move || {
-                let mut ssh = SSHConnection::new(spec, false);
-                if let Err(e) = ssh.connect() {
-                    eprintln!("  Worker {}: SSH connect failed: {}", worker_id, e);
-                    return;
-                }
-
-                loop {
-                    let job = match job_rx.recv() {
-                        Ok(j) => j,
-                        Err(_) => break,
-                    };
-                    match job {
-                        TransferJob::Shutdown => break,
-                        TransferJob::Batch(batch) => {
-                            let (bytes, files) =
-                                recv_tar_batch(&batch, &mut ssh, &src_root, &dst_root, &cfg);
-                            let _ = result_tx.send((bytes, files as u64));
+                std::thread::spawn(move || {
+                    let mut ssh = SSHConnection::new(spec, false);
+                    if let Err(e) = ssh.connect() {
+                        eprintln!("  Worker {}: SSH connect failed: {}", worker_id, e);
+                        let _ = result_tx.send((0, 0));
+                        return;
+                    }
+                    loop {
+                        let job = match job_rx.recv() {
+                            Ok(j) => j,
+                            Err(_) => break,
+                        };
+                        match job {
+                            TransferJob::Shutdown => break,
+                            TransferJob::Batch(batch) => {
+                                let (bytes, files) =
+                                    recv_tar_batch(&batch, &mut ssh, &src_root, &dst_root, &cfg);
+                                let _ = result_tx.send((bytes, files as u64));
+                            }
                         }
                     }
-                }
+                })
             })
-        })
-        .collect();
+            .collect();
 
-    for _ in &workers {
-        if let Ok((b, f)) = result_rx.recv() {
-            progress.update(b, f as usize);
-            progress.display();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        for _ in &workers {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() { break; }
+            if let Ok((b, f)) = result_rx.recv_timeout(remaining) {
+                progress.update(b, f as usize);
+                progress.display();
+            } else {
+                break;
+            }
+        }
+        for w in workers {
+            w.join().ok();
         }
     }
-    for w in workers {
-        w.join().ok();
-    }
-}
 
 // ── Relay mode: remote → remote ───────────────────────────────────────
 
@@ -280,10 +292,12 @@ pub fn copy_remote_relay_parallel(
 
                 if let Err(e) = src_ssh.connect() {
                     eprintln!("  Worker {}: source SSH connect failed: {}", worker_id, e);
+                    let _ = result_tx.send((0, 0));
                     return;
                 }
                 if let Err(e) = dst_ssh.connect() {
                     eprintln!("  Worker {}: dest SSH connect failed: {}", worker_id, e);
+                    let _ = result_tx.send((0, 0));
                     return;
                 }
                 let _ = dst_ssh.exec_cmd(&format!("mkdir -p {}", shq(&dst_root)), 30000);
@@ -312,10 +326,15 @@ pub fn copy_remote_relay_parallel(
         })
         .collect();
 
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
     for _ in &workers {
-        if let Ok((b, f)) = result_rx.recv() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() { break; }
+        if let Ok((b, f)) = result_rx.recv_timeout(remaining) {
             progress.update(b, f as usize);
             progress.display();
+        } else {
+            break;
         }
     }
     for w in workers {
