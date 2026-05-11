@@ -371,10 +371,11 @@ fn main() {
                     buf_size,
                 };
                 let ssh_shared = std::sync::Arc::new(std::sync::Mutex::new(
+                    // take ownership; the Arc stays alive for all workers via clone
                     std::mem::take(ssh),
                 ));
                 fc_rs::transfer::copy_remote_parallel(
-                    &copy_entries, &dst_path, &progress, &cfg, ssh_shared,
+                    &copy_entries, &dst_path, &progress, &cfg, &ssh_shared,
                 );
                 progress.finish();
 

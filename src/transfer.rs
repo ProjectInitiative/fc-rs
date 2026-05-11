@@ -74,7 +74,7 @@ fn stream_tar(chunk: &[FileEntry], channel: ssh2::Channel, compress: bool, level
 pub fn copy_remote_parallel(
     entries: &[FileEntry], remote_root: &str,
     _progress: &Progress, config: &TransferConfig,
-    ssh: Arc<Mutex<SSHConnection>>,
+    ssh: &std::sync::Arc<std::sync::Mutex<SSHConnection>>,
 ) {
     let planner = TransferPlanner::new(entries, config.workers);
     let jobs = planner.jobs; if jobs.is_empty() { return; }
