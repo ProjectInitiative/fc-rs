@@ -12,6 +12,9 @@ pub struct CliArgs {
     #[arg(long, default_value_t = 4)]
     pub threads: usize,
 
+    #[arg(long, default_value_t = 4)]
+    pub workers: usize,
+
     #[arg(long)]
     pub dry_run: bool,
 

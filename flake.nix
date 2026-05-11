@@ -128,6 +128,7 @@
             cargo-edit
             cargo-watch
             rust-analyzer
+            pkg-config
           ];
           shellHook = ''
             echo "Rust dev environment (crane)"

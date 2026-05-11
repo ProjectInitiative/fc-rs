@@ -83,6 +83,12 @@ impl SSHConnection {
         Ok(self.sftp.as_mut().unwrap())
     }
 
+    pub fn open_channel(&self) -> Result<ssh2::Channel, String> {
+        let session = self.session.as_ref().ok_or("Not connected")?;
+        let channel = session.channel_session().map_err(|e| e.to_string())?;
+        Ok(channel)
+    }
+
     fn detect_capabilities(&mut self, _session: &Session) {
         self.caps.push("tar".to_string());
         self.caps.push("python3".to_string());

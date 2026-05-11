@@ -13,6 +13,7 @@ pub mod progress;
 pub mod scanner;
 pub mod space_check;
 pub mod ssh;
+pub mod transfer;
 pub mod types;
 pub mod update;
 pub mod verify;

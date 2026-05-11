@@ -33,3 +33,5 @@ rpassword = "7"
 shlex = "1"
 whoami = "1"
 regex = "1"
+zstd = { version = "0.13", features = ["experimental"] }
+crossbeam-channel = "0.5"

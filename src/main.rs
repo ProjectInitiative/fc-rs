@@ -350,7 +350,24 @@ fn main() {
                 let _ = ssh.exec_cmd(&format!("mkdir -p {}", shlex::quote(&dst_path)), 30000);
                 let progress = Progress::new(unique_size, copy_entries.len());
                 let t0 = Instant::now();
-                copy_hybrid_remote(&copy_entries, ssh, &dst_path, &progress, buf_size);
+
+                if args.workers > 1 {
+                    let cfg = fc_rs::transfer::TransferConfig {
+                        workers: args.workers,
+                        compress_zstd: args.compress,
+                        zstd_level: 3,
+                        buf_size,
+                    };
+                    fc_rs::transfer::copy_remote_parallel(
+                        &copy_entries,
+                        &ssh.spec,
+                        &dst_path,
+                        &progress,
+                        &cfg,
+                    );
+                } else {
+                    copy_hybrid_remote(&copy_entries, ssh, &dst_path, &progress, buf_size);
+                }
                 progress.finish();
 
                 if !link_map.is_empty() {
