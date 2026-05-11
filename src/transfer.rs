@@ -104,6 +104,7 @@ fn send_batch(
     let mut total_b = 0u64; let mut total_f = 0usize;
     let nchunks = estimate_chunks(batch, MAX_CHUNK);
     let mut pos = 0usize; let mut idx = 0usize;
+    eprintln!("\n  W{} starting batch of {} files ({}), nchunks={}", id, batch.len(), progress::fmt_size(batch.iter().map(|e| e.size).sum()), nchunks);
     while pos < batch.len() {
         let end = next_pos(batch, pos);
         let chunk = &batch[pos..end]; pos = end; idx += 1;
@@ -112,13 +113,20 @@ fn send_batch(
         } else {
             format!("tar xf - --no-same-owner --no-same-permissions -C {}", shq(rroot))
         };
-        if let Ok(mut ch) = ssh.open_channel() {
-            if ch.exec(&cmd).is_err() { break; }
-            if let Ok((mut ch, b)) = stream_tar(chunk, ch, cfg.compress_zstd, cfg.zstd_level) {
-                let _ = ch.eof(); ch.wait_close().ok();
-                total_b += b; total_f += chunk.len();
-                let _ = tx.send(WorkerMsg::Chunk { id, bytes: b, done: idx, total: nchunks });
+        match ssh.open_channel() {
+            Ok(mut ch) => {
+                if ch.exec(&cmd).is_err() { eprintln!("\n  W{} exec failed", id); break; }
+                match stream_tar(chunk, ch, cfg.compress_zstd, cfg.zstd_level) {
+                    Ok((mut ch, b)) => {
+                        let _ = ch.eof(); ch.wait_close().ok();
+                        total_b += b; total_f += chunk.len();
+                        eprintln!("\n  W{} chunk {}/{} done ({} bytes)", id, idx, nchunks, b);
+                        let _ = tx.send(WorkerMsg::Chunk { id, bytes: b, done: idx, total: nchunks });
+                    }
+                    Err(e) => { eprintln!("\n  W{} stream_tar error: {}", id, e); break; }
+                }
             }
+            Err(e) => { eprintln!("\n  W{} open_channel error: {}", id, e); break; }
         }
     }
     (total_b, total_f)
