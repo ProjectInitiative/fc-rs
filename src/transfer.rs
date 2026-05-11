@@ -45,31 +45,6 @@ impl TransferPlanner {
     }
 }
 
-// ── Shared worker body ──────────────────────────────────────────────
-
-fn worker_main(
-    jr: crossbeam_channel::Receiver<Vec<FileEntry>>,
-    rt: crossbeam_channel::Sender<WorkerMsg>,
-    id: usize, spec: RemoteSpec, rpath: String,
-    mkdir: bool,
-    process: impl Fn(&[FileEntry], &mut SSHConnection, usize, &crossbeam_channel::Sender<WorkerMsg>, &str) + Send + 'static,
-) {
-    let mut ssh = SSHConnection::new(spec, false);
-    if let Err(e) = ssh.connect() {
-        eprintln!("  W{} SSH: {}", id, e);
-        let _ = rt.send(WorkerMsg::Done { id, bytes: 0, files: 0 }); return;
-    }
-    if mkdir { let _ = ssh.mkdir_p(&rpath); }
-    let mut total = (0u64, 0usize);
-    loop {
-        let b = match jr.recv() { Ok(b) => b, Err(_) => break };
-        if b.is_empty() { break; }
-        process(&b, &mut ssh, id, &rt, &rpath);
-        for e in &b { total.0 += e.size; total.1 += 1; }
-    }
-    let _ = rt.send(WorkerMsg::Done { id, bytes: total.0, files: total.1 });
-}
-
 // ── File transfer helpers ───────────────────────────────────────────
 
 fn push_file(
@@ -125,40 +100,46 @@ fn launch(
     process: impl Fn(&[FileEntry], &mut SSHConnection, usize, &crossbeam_channel::Sender<WorkerMsg>, &str) + Clone + Send + 'static,
 ) {
     let planner = TransferPlanner::new(entries);
+    if planner.large_jobs.is_empty() && planner.small_jobs.is_empty() { return; }
     let n_large = planner.large_jobs.len();
     let n_small = planner.small_jobs.len();
-    if n_large + n_small == 0 { return; }
-
-    // Dedicated large-file workers vs best-effort small-file workers
-    let large_workers = std::cmp::max(1, ((cfg.workers as f64 * 0.6) as usize).min(n_large));
-    let small_workers = cfg.workers - large_workers;
-
-    // Two separate channels — large workers never see small jobs
     let (ljt, ljr) = unbounded();
     let (sjt, sjr) = unbounded();
     let (rt, rr) = unbounded::<WorkerMsg>();
     for j in planner.large_jobs { ljt.send(j).ok(); }
     for j in planner.small_jobs { sjt.send(j).ok(); }
-    for _ in 0..large_workers { ljt.send(Vec::new()).ok(); }
-    for _ in 0..small_workers { sjt.send(Vec::new()).ok(); }
+    // Send sentinels to both queues per worker so they fall through
+    for _ in 0..cfg.workers {
+        ljt.send(Vec::new()).ok();
+        sjt.send(Vec::new()).ok();
+    }
 
     let spec = spec.clone(); let nw = cfg.workers;
-    let mut handles = Vec::new();
+    let handles: Vec<_> = (0..nw).map(|id| {
+        let (ljr, sjr, rt, spec, rp, p) = (
+            ljr.clone(), sjr.clone(), rt.clone(), spec.clone(), rpath.clone(), process.clone(),
+        );
+        std::thread::spawn(move || {
+            let mut ssh = SSHConnection::new(spec, false);
+            if let Err(e) = ssh.connect() {
+                eprintln!("  W{} SSH: {}", id, e); let _ = rt.send(WorkerMsg::Done { id, bytes: 0, files: 0 }); return;
+            }
+            if mkdir { let _ = ssh.mkdir_p(&rp); }
+            let mut total = (0u64, 0usize);
+            for recv in [&ljr, &sjr] {
+                loop {
+                    let b = match recv.recv() { Ok(b) => b, Err(_) => break };
+                    if b.is_empty() { break; }
+                    p(&b, &mut ssh, id, &rt, &rp);
+                    for e in &b { total.0 += e.size; total.1 += 1; }
+                }
+            }
+            let _ = rt.send(WorkerMsg::Done { id, bytes: total.0, files: total.1 });
+        })
+    }).collect();
 
-    // Large-file workers
-    for i in 0..large_workers {
-        let (jr, rt, spec, rp, p) = (ljr.clone(), rt.clone(), spec.clone(), rpath.clone(), process.clone());
-        handles.push(std::thread::spawn(move || worker_main(jr, rt, i, spec, rp, mkdir, p)));
-    }
-    // Small-file workers
-    for i in 0..small_workers {
-        let id = large_workers + i;
-        let (jr, rt, spec, rp, p) = (sjr.clone(), rt.clone(), spec.clone(), rpath.clone(), process.clone());
-        handles.push(std::thread::spawn(move || worker_main(jr, rt, id, spec, rp, mkdir, p)));
-    }
-
-    eprintln!("  {} large workers → {} files, {} small workers → {} tar batches",
-        large_workers, n_large, small_workers, n_small);
+    if n_large > 0 { eprintln!("  {} large files, {} tar batches across {} workers",
+        n_large, n_small, nw); }
     render_loop(&rr, nw);
     for h in handles { h.join().ok(); } eprintln!();
 }
