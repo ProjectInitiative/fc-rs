@@ -150,6 +150,17 @@ fn main() {
         src_ssh = Some(ssh);
     }
 
+    if let Some(ref spec) = dst_remote {
+        banner("SSH - Connecting to destination");
+        let mut ssh = SSHConnection::new(spec.clone(), args.compress);
+        if let Err(e) = ssh.connect() {
+            eprintln!("  Error connecting to destination: {}", e);
+            std::process::exit(1);
+        }
+        eprintln!("  Connected to {}@{}:{}", spec.user, spec.host, spec.port);
+        dst_ssh = Some(ssh);
+    }
+
     banner("Phase 1 - Scanning source");
 
     let mut exclude_list = ExcludeList::new();
@@ -279,6 +290,8 @@ fn main() {
 
     if matches!(mode, CopyMode::LocalToRemote | CopyMode::LocalToLocal) {
         banner("Phase 4 - Mapping physical disk layout");
+        eprintln!("  {} files, sorting by size (no FIEMAP on this platform)",
+            copy_entries.len());
         copy_entries = physical_offset::resolve_physical_offsets(&copy_entries, args.threads);
     }
 
