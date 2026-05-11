@@ -64,9 +64,8 @@ impl SSHConnection {
                 self.spec.user, self.spec.host
             )) {
                 Ok(password) => {
-                    authed = session
-                        .userauth_password(&self.spec.user, &password)
-                        .is_ok();
+                    let _ = session
+                        .userauth_password(&self.spec.user, &password);
                 }
                 Err(_) => {
                     return Err(
