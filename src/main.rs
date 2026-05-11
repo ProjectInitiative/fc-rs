@@ -424,7 +424,12 @@ fn main() {
                 }
             } else if let Some(ref mut ssh) = src_ssh {
                 copy_hybrid_remote_to_local(
-                    &copy_entries, ssh, &source, Path::new(&dst_path), &progress, buf_size,
+                    &copy_entries,
+                    ssh,
+                    &source,
+                    Path::new(&dst_path),
+                    &progress,
+                    buf_size,
                 );
             }
             progress.finish();
@@ -457,8 +462,12 @@ fn main() {
         }
 
         CopyMode::RemoteToRemote => {
-            if let (Some(ref src_spec), Some(ref dst_spec)) = (src_remote.as_ref(), dst_remote.as_ref()) {
-                let _ = dst_ssh.as_ref().map(|s| s.exec_cmd(&format!("mkdir -p {}", shlex::quote(&dst_path)), 30000));
+            if let (Some(ref src_spec), Some(ref dst_spec)) =
+                (src_remote.as_ref(), dst_remote.as_ref())
+            {
+                let _ = dst_ssh
+                    .as_ref()
+                    .map(|s| s.exec_cmd(&format!("mkdir -p {}", shlex::quote(&dst_path)), 30000));
                 let progress = Progress::new(unique_size, copy_entries.len());
                 let t0 = Instant::now();
 
@@ -470,16 +479,27 @@ fn main() {
                         buf_size,
                     };
                     fc_rs::transfer::copy_remote_relay_parallel(
-                        &copy_entries, src_spec, dst_spec,
-                        &source, &dst_path, &progress, &cfg,
+                        &copy_entries,
+                        src_spec,
+                        dst_spec,
+                        &source,
+                        &dst_path,
+                        &progress,
+                        &cfg,
                     );
                 } else if let (Some(ref mut src_ssh_val), Some(ref mut dst_ssh_val)) =
                     (&mut src_ssh, &mut dst_ssh)
                 {
-                    let _ = dst_ssh_val.exec_cmd(&format!("mkdir -p {}", shlex::quote(&dst_path)), 30000);
+                    let _ = dst_ssh_val
+                        .exec_cmd(&format!("mkdir -p {}", shlex::quote(&dst_path)), 30000);
                     copy_hybrid_r2r(
-                        &copy_entries, src_ssh_val, dst_ssh_val,
-                        &source, &dst_path, &progress, buf_size,
+                        &copy_entries,
+                        src_ssh_val,
+                        dst_ssh_val,
+                        &source,
+                        &dst_path,
+                        &progress,
+                        buf_size,
                     );
                 }
                 progress.finish();
@@ -496,9 +516,7 @@ fn main() {
                         0.0
                     };
 
-                    fc_rs::manifest::save_remote_manifest(
-                        s, &dst_path, &copy_entries, &link_map,
-                    );
+                    fc_rs::manifest::save_remote_manifest(s, &dst_path, &copy_entries, &link_map);
 
                     banner("DONE");
                     eprintln!("  Files:   {} total", total_files);

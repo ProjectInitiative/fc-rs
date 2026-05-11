@@ -128,10 +128,7 @@ pub fn copy_remote_parallel(
                     eprintln!("  Worker {}: SSH connect failed: {}", worker_id, e);
                     return;
                 }
-                let _ = ssh.exec_cmd(
-                    &format!("mkdir -p {}", shlex::quote(&remote_root)),
-                    30000,
-                );
+                let _ = ssh.exec_cmd(&format!("mkdir -p {}", shlex::quote(&remote_root)), 30000);
 
                 loop {
                     let job = match job_rx.recv() {
@@ -213,9 +210,8 @@ pub fn copy_remote_pull_parallel(
                     match job {
                         TransferJob::Shutdown => break,
                         TransferJob::Batch(batch) => {
-                            let (bytes, files) = recv_tar_batch(
-                                &batch, &mut ssh, &src_root, &dst_root, &cfg,
-                            );
+                            let (bytes, files) =
+                                recv_tar_batch(&batch, &mut ssh, &src_root, &dst_root, &cfg);
                             let _ = result_tx.send((bytes, files as u64));
                         }
                     }
@@ -285,10 +281,7 @@ pub fn copy_remote_relay_parallel(
                     eprintln!("  Worker {}: dest SSH connect failed: {}", worker_id, e);
                     return;
                 }
-                let _ = dst_ssh.exec_cmd(
-                    &format!("mkdir -p {}", shlex::quote(&dst_root)),
-                    30000,
-                );
+                let _ = dst_ssh.exec_cmd(&format!("mkdir -p {}", shlex::quote(&dst_root)), 30000);
 
                 loop {
                     let job = match job_rx.recv() {
@@ -390,10 +383,7 @@ fn recv_tar_batch(
         file_names.push(b'\0');
     }
 
-    let src_cmd = format!(
-        "cd {} && tar cf - --null -T -",
-        shlex::quote(src_root)
-    );
+    let src_cmd = format!("cd {} && tar cf - --null -T -", shlex::quote(src_root));
 
     let dst_cmd = if config.compress_zstd {
         "zstd -d 2>/dev/null | tar xf - --no-same-owner --no-same-permissions".to_string()
@@ -462,10 +452,7 @@ fn relay_tar_batch(
         file_names.push(b'\0');
     }
 
-    let src_cmd = format!(
-        "cd {} && tar cf - --null -T -",
-        shlex::quote(src_root)
-    );
+    let src_cmd = format!("cd {} && tar cf - --null -T -", shlex::quote(src_root));
 
     let dst_cmd = if config.compress_zstd {
         format!(

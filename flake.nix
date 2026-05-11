@@ -36,12 +36,7 @@
 
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
-        fc-rs-unwrapped = craneLib.buildPackage (
-          commonArgs
-          // {
-            inherit cargoArtifacts;
-          }
-        );
+        fc-rs-unwrapped = craneLib.buildPackage (commonArgs // { inherit cargoArtifacts; });
 
         fc-rs =
           pkgs.runCommand "fc-rs"
@@ -69,57 +64,39 @@
                 }
             '';
 
-        # Python reference implementation
         fast-copy-python = pkgs.callPackage ./nix/fast-copy-python.nix {
           fast-copy-src = ./vendor/fast-copy;
         };
 
-        # Test data generator
         testData = pkgs.runCommand "fc-rs-test-data" { } ''
           mkdir -p $out
-
           echo "hello world" > $out/hello.txt
           echo "small file content here" > $out/small.txt
           printf "line1\nline2\nline3\n" > $out/multiline.txt
-
           mkdir -p $out/sub/deep
           echo "deep nested" > $out/sub/deep/nested.txt
           echo "sub file" > $out/sub/subfile.txt
           mkdir -p $out/sub/empty_dir
-
           dd if=/dev/urandom bs=1024 count=2 of=$out/random-2k.bin 2>/dev/null
           dd if=/dev/urandom bs=1024 count=10 of=$out/random-10k.bin 2>/dev/null
-
           touch $out/empty.txt
-
           echo "dedup-me" > $out/dedup_original.txt
           cp $out/dedup_original.txt $out/dedup_copy1.txt
           cp $out/dedup_original.txt $out/dedup_copy2.txt
-
           dd if=/dev/urandom bs=1M count=2 of=$out/large-2m.bin 2>/dev/null
           dd if=/dev/zero bs=1M count=1 of=$out/zero-1m.bin 2>/dev/null
-
           echo "spaces" > "$out/file with spaces.txt"
           echo "parens" > "$out/file_(1).txt"
         '';
 
-        # Build a pkgs set with our packages overlaid for the test
         pkgsForTest = import nixpkgs {
           inherit system;
-          overlays = [
-            (final: prev: {
-              inherit fc-rs fast-copy-python testData;
-            })
-          ];
+          overlays = [ (final: prev: { inherit fc-rs fast-copy-python testData; }) ];
         };
 
       in
       {
-        packages = {
-          default = fc-rs;
-          fast-copy-python = fast-copy-python;
-          testData = testData;
-        };
+        packages.default = fc-rs;
 
         devShells.default = pkgs.mkShell {
           inputsFrom = [ self.packages.${system}.default ];
@@ -169,5 +146,10 @@
 
         formatter = pkgs.nixfmt;
       }
-    );
+    )
+    // {
+      overlays.default = final: prev: {
+        fc-rs = self.packages.${final.system}.default;
+      };
+    };
 }
