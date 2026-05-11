@@ -404,14 +404,27 @@ fn main() {
         CopyMode::RemoteToLocal => {
             let progress = Progress::new(unique_size, copy_entries.len());
             let t0 = Instant::now();
-            if let Some(ref mut ssh) = src_ssh {
+
+            if args.workers > 1 {
+                if let Some(ref spec) = src_remote {
+                    let cfg = fc_rs::transfer::TransferConfig {
+                        workers: args.workers,
+                        compress_zstd: args.compress,
+                        zstd_level: 3,
+                        buf_size,
+                    };
+                    fc_rs::transfer::copy_remote_pull_parallel(
+                        &copy_entries,
+                        spec,
+                        &source,
+                        Path::new(&dst_path),
+                        &progress,
+                        &cfg,
+                    );
+                }
+            } else if let Some(ref mut ssh) = src_ssh {
                 copy_hybrid_remote_to_local(
-                    &copy_entries,
-                    ssh,
-                    &source,
-                    Path::new(&dst_path),
-                    &progress,
-                    buf_size,
+                    &copy_entries, ssh, &source, Path::new(&dst_path), &progress, buf_size,
                 );
             }
             progress.finish();
@@ -444,47 +457,55 @@ fn main() {
         }
 
         CopyMode::RemoteToRemote => {
-            if let (Some(ref mut src_ssh_val), Some(ref mut dst_ssh_val)) =
-                (&mut src_ssh, &mut dst_ssh)
-            {
-                let _ =
-                    dst_ssh_val.exec_cmd(&format!("mkdir -p {}", shlex::quote(&dst_path)), 30000);
+            if let (Some(ref src_spec), Some(ref dst_spec)) = (src_remote.as_ref(), dst_remote.as_ref()) {
+                let _ = dst_ssh.as_ref().map(|s| s.exec_cmd(&format!("mkdir -p {}", shlex::quote(&dst_path)), 30000));
                 let progress = Progress::new(unique_size, copy_entries.len());
                 let t0 = Instant::now();
-                copy_hybrid_r2r(
-                    &copy_entries,
-                    src_ssh_val,
-                    dst_ssh_val,
-                    &source,
-                    &dst_path,
-                    &progress,
-                    buf_size,
-                );
+
+                if args.workers > 1 {
+                    let cfg = fc_rs::transfer::TransferConfig {
+                        workers: args.workers,
+                        compress_zstd: args.compress,
+                        zstd_level: 3,
+                        buf_size,
+                    };
+                    fc_rs::transfer::copy_remote_relay_parallel(
+                        &copy_entries, src_spec, dst_spec,
+                        &source, &dst_path, &progress, &cfg,
+                    );
+                } else if let (Some(ref mut src_ssh_val), Some(ref mut dst_ssh_val)) =
+                    (&mut src_ssh, &mut dst_ssh)
+                {
+                    let _ = dst_ssh_val.exec_cmd(&format!("mkdir -p {}", shlex::quote(&dst_path)), 30000);
+                    copy_hybrid_r2r(
+                        &copy_entries, src_ssh_val, dst_ssh_val,
+                        &source, &dst_path, &progress, buf_size,
+                    );
+                }
                 progress.finish();
 
-                if !link_map.is_empty() {
-                    create_links_remote(dst_ssh_val, &link_map, &dst_path);
+                if let Some(ref mut s) = dst_ssh {
+                    if !link_map.is_empty() {
+                        create_links_remote(s, &link_map, &dst_path);
+                    }
+
+                    let elapsed = t0.elapsed().as_secs_f64();
+                    let speed = if elapsed > 0.0 {
+                        unique_size as f64 / elapsed
+                    } else {
+                        0.0
+                    };
+
+                    fc_rs::manifest::save_remote_manifest(
+                        s, &dst_path, &copy_entries, &link_map,
+                    );
+
+                    banner("DONE");
+                    eprintln!("  Files:   {} total", total_files);
+                    eprintln!("  Data:    {} relayed", progress::fmt_size(unique_size));
+                    eprintln!("  Time:    {}", progress::fmt_time(elapsed as u64));
+                    eprintln!("  Speed:   {}/s", progress::fmt_size_f64(speed));
                 }
-
-                let elapsed = t0.elapsed().as_secs_f64();
-                let speed = if elapsed > 0.0 {
-                    unique_size as f64 / elapsed
-                } else {
-                    0.0
-                };
-
-                fc_rs::manifest::save_remote_manifest(
-                    dst_ssh_val,
-                    &dst_path,
-                    &copy_entries,
-                    &link_map,
-                );
-
-                banner("DONE");
-                eprintln!("  Files:   {} total", total_files);
-                eprintln!("  Data:    {} relayed", progress::fmt_size(unique_size));
-                eprintln!("  Time:    {}", progress::fmt_time(elapsed as u64));
-                eprintln!("  Speed:   {}/s", progress::fmt_size_f64(speed));
             }
         }
     }

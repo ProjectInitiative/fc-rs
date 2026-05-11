@@ -1,5 +1,6 @@
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 
@@ -87,6 +88,8 @@ impl TransferPlanner {
     }
 }
 
+// ── Push mode: local → remote ─────────────────────────────────────────
+
 pub fn copy_remote_parallel(
     entries: &[FileEntry],
     spec: &RemoteSpec,
@@ -96,7 +99,6 @@ pub fn copy_remote_parallel(
 ) {
     let planner = TransferPlanner::new(entries, config.workers);
     let jobs = planner.into_jobs();
-
     if jobs.is_empty() {
         return;
     }
@@ -126,7 +128,6 @@ pub fn copy_remote_parallel(
                     eprintln!("  Worker {}: SSH connect failed: {}", worker_id, e);
                     return;
                 }
-
                 let _ = ssh.exec_cmd(
                     &format!("mkdir -p {}", shlex::quote(&remote_root)),
                     30000,
@@ -137,7 +138,6 @@ pub fn copy_remote_parallel(
                         Ok(j) => j,
                         Err(_) => break,
                     };
-
                     match job {
                         TransferJob::Shutdown => break,
                         TransferJob::Batch(batch) => {
@@ -157,11 +157,175 @@ pub fn copy_remote_parallel(
             progress.display();
         }
     }
-
     for w in workers {
         w.join().ok();
     }
 }
+
+// ── Pull mode: remote → local ─────────────────────────────────────────
+
+pub fn copy_remote_pull_parallel(
+    entries: &[FileEntry],
+    spec: &RemoteSpec,
+    src_root: &str,
+    dst_root: &Path,
+    progress: &Progress,
+    config: &TransferConfig,
+) {
+    let planner = TransferPlanner::new(entries, config.workers);
+    let jobs = planner.into_jobs();
+    if jobs.is_empty() {
+        return;
+    }
+
+    let (job_tx, job_rx): (Sender<TransferJob>, Receiver<TransferJob>) = bounded(jobs.len());
+    let (result_tx, result_rx): (Sender<(u64, u64)>, Receiver<(u64, u64)>) =
+        bounded(config.workers);
+
+    for job in jobs {
+        job_tx.send(job).ok();
+    }
+    for _ in 0..config.workers {
+        job_tx.send(TransferJob::Shutdown).ok();
+    }
+
+    let workers: Vec<_> = (0..config.workers)
+        .map(|worker_id| {
+            let job_rx = job_rx.clone();
+            let result_tx = result_tx.clone();
+            let spec = spec.clone();
+            let src_root = src_root.to_string();
+            let dst_root = dst_root.to_path_buf();
+            let cfg = config.clone();
+
+            std::thread::spawn(move || {
+                let mut ssh = SSHConnection::new(spec, false);
+                if let Err(e) = ssh.connect() {
+                    eprintln!("  Worker {}: SSH connect failed: {}", worker_id, e);
+                    return;
+                }
+
+                loop {
+                    let job = match job_rx.recv() {
+                        Ok(j) => j,
+                        Err(_) => break,
+                    };
+                    match job {
+                        TransferJob::Shutdown => break,
+                        TransferJob::Batch(batch) => {
+                            let (bytes, files) = recv_tar_batch(
+                                &batch, &mut ssh, &src_root, &dst_root, &cfg,
+                            );
+                            let _ = result_tx.send((bytes, files as u64));
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+
+    for _ in &workers {
+        if let Ok((b, f)) = result_rx.recv() {
+            progress.update(b, f as usize);
+            progress.display();
+        }
+    }
+    for w in workers {
+        w.join().ok();
+    }
+}
+
+// ── Relay mode: remote → remote ───────────────────────────────────────
+
+pub fn copy_remote_relay_parallel(
+    entries: &[FileEntry],
+    src_spec: &RemoteSpec,
+    dst_spec: &RemoteSpec,
+    src_root: &str,
+    dst_root: &str,
+    progress: &Progress,
+    config: &TransferConfig,
+) {
+    let planner = TransferPlanner::new(entries, config.workers);
+    let jobs = planner.into_jobs();
+    if jobs.is_empty() {
+        return;
+    }
+
+    let (job_tx, job_rx): (Sender<TransferJob>, Receiver<TransferJob>) = bounded(jobs.len());
+    let (result_tx, result_rx): (Sender<(u64, u64)>, Receiver<(u64, u64)>) =
+        bounded(config.workers);
+
+    for job in jobs {
+        job_tx.send(job).ok();
+    }
+    for _ in 0..config.workers {
+        job_tx.send(TransferJob::Shutdown).ok();
+    }
+
+    let workers: Vec<_> = (0..config.workers)
+        .map(|worker_id| {
+            let job_rx = job_rx.clone();
+            let result_tx = result_tx.clone();
+            let src_spec = src_spec.clone();
+            let dst_spec = dst_spec.clone();
+            let src_root = src_root.to_string();
+            let dst_root = dst_root.to_string();
+            let cfg = config.clone();
+
+            std::thread::spawn(move || {
+                let mut src_ssh = SSHConnection::new(src_spec, false);
+                let mut dst_ssh = SSHConnection::new(dst_spec, false);
+
+                if let Err(e) = src_ssh.connect() {
+                    eprintln!("  Worker {}: source SSH connect failed: {}", worker_id, e);
+                    return;
+                }
+                if let Err(e) = dst_ssh.connect() {
+                    eprintln!("  Worker {}: dest SSH connect failed: {}", worker_id, e);
+                    return;
+                }
+                let _ = dst_ssh.exec_cmd(
+                    &format!("mkdir -p {}", shlex::quote(&dst_root)),
+                    30000,
+                );
+
+                loop {
+                    let job = match job_rx.recv() {
+                        Ok(j) => j,
+                        Err(_) => break,
+                    };
+                    match job {
+                        TransferJob::Shutdown => break,
+                        TransferJob::Batch(batch) => {
+                            let (bytes, files) = relay_tar_batch(
+                                &batch,
+                                &mut src_ssh,
+                                &mut dst_ssh,
+                                &src_root,
+                                &dst_root,
+                                &cfg,
+                            );
+                            let _ = result_tx.send((bytes, files as u64));
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+
+    for _ in &workers {
+        if let Ok((b, f)) = result_rx.recv() {
+            progress.update(b, f as usize);
+            progress.display();
+        }
+    }
+    for w in workers {
+        w.join().ok();
+    }
+}
+
+// ── Push: build tar locally, send over SSH ────────────────────────────
 
 fn send_tar_batch(
     batch: &[FileEntry],
@@ -173,8 +337,199 @@ fn send_tar_batch(
         return (0, 0);
     }
 
+    let tar_data = build_tar(batch, config);
+    if tar_data.is_empty() {
+        return (0, 0);
+    }
+
+    let cmd = if config.compress_zstd {
+        format!(
+            "zstd -d 2>/dev/null | tar xf - --no-same-owner --no-same-permissions -C {}",
+            shlex::quote(remote_root)
+        )
+    } else {
+        format!(
+            "tar xf - --no-same-owner --no-same-permissions -C {}",
+            shlex::quote(remote_root)
+        )
+    };
+
+    match ssh.open_channel() {
+        Ok(mut channel) => {
+            if channel.exec(&cmd).is_err() {
+                return (0, 0);
+            }
+            let _ = channel.write_all(&tar_data);
+            let _ = channel.eof();
+            channel.wait_close().ok();
+            (tar_data.len() as u64, batch.len())
+        }
+        Err(e) => {
+            eprintln!("  channel error: {}", e);
+            (0, 0)
+        }
+    }
+}
+
+// ── Pull: exec tar on remote, read stream, extract locally ────────────
+
+fn recv_tar_batch(
+    batch: &[FileEntry],
+    ssh: &mut SSHConnection,
+    src_root: &str,
+    dst_root: &Path,
+    config: &TransferConfig,
+) -> (u64, usize) {
+    if batch.is_empty() {
+        return (0, 0);
+    }
+
+    let mut file_names: Vec<u8> = Vec::new();
+    for e in batch {
+        file_names.extend_from_slice(e.rel.as_bytes());
+        file_names.push(b'\0');
+    }
+
+    let src_cmd = format!(
+        "cd {} && tar cf - --null -T -",
+        shlex::quote(src_root)
+    );
+
+    let dst_cmd = if config.compress_zstd {
+        "zstd -d 2>/dev/null | tar xf - --no-same-owner --no-same-permissions".to_string()
+    } else {
+        "tar xf - --no-same-owner --no-same-permissions".to_string()
+    };
+
+    let mut channel = match ssh.open_channel() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  channel error: {}", e);
+            return (0, 0);
+        }
+    };
+
+    if channel.exec(&src_cmd).is_err() {
+        return (0, 0);
+    }
+
+    let _ = channel.write_all(&file_names);
+    let _ = channel.eof();
+
+    let data: Vec<u8> = if config.compress_zstd {
+        let mut compressed = Vec::new();
+        if channel.read_to_end(&mut compressed).is_err() {
+            return (0, 0);
+        }
+        zstd::decode_all(&compressed[..]).unwrap_or(compressed)
+    } else {
+        let mut raw = Vec::new();
+        if channel.read_to_end(&mut raw).is_err() {
+            return (0, 0);
+        }
+        raw
+    };
+
+    channel.wait_close().ok();
+
+    let mut archive = tar::Archive::new(std::io::Cursor::new(&data));
+    if let Err(e) = archive.unpack(dst_root) {
+        eprintln!("  tar extract error: {}", e);
+        return (0, 0);
+    }
+
     let total_size: u64 = batch.iter().map(|e| e.size).sum();
-    let total_files = batch.len();
+    (total_size, batch.len())
+}
+
+// ── Relay: pipe tar from source SSH → local → dest SSH ───────────────
+
+fn relay_tar_batch(
+    batch: &[FileEntry],
+    src_ssh: &mut SSHConnection,
+    dst_ssh: &mut SSHConnection,
+    src_root: &str,
+    dst_root: &str,
+    config: &TransferConfig,
+) -> (u64, usize) {
+    if batch.is_empty() {
+        return (0, 0);
+    }
+
+    let mut file_names: Vec<u8> = Vec::new();
+    for e in batch {
+        file_names.extend_from_slice(e.rel.as_bytes());
+        file_names.push(b'\0');
+    }
+
+    let src_cmd = format!(
+        "cd {} && tar cf - --null -T -",
+        shlex::quote(src_root)
+    );
+
+    let dst_cmd = if config.compress_zstd {
+        format!(
+            "zstd -d 2>/dev/null | tar xf - --no-same-owner --no-same-permissions -C {}",
+            shlex::quote(dst_root)
+        )
+    } else {
+        format!(
+            "tar xf - --no-same-owner --no-same-permissions -C {}",
+            shlex::quote(dst_root)
+        )
+    };
+
+    let mut src_channel = match src_ssh.open_channel() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  src channel error: {}", e);
+            return (0, 0);
+        }
+    };
+
+    let mut dst_channel = match dst_ssh.open_channel() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  dst channel error: {}", e);
+            return (0, 0);
+        }
+    };
+
+    if src_channel.exec(&src_cmd).is_err() {
+        return (0, 0);
+    }
+    if dst_channel.exec(&dst_cmd).is_err() {
+        return (0, 0);
+    }
+
+    let _ = src_channel.write_all(&file_names);
+    let _ = src_channel.eof();
+
+    let mut relayed = 0u64;
+    let mut buf = vec![0u8; config.buf_size];
+    loop {
+        let n = match src_channel.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        if dst_channel.write_all(&buf[..n]).is_err() {
+            break;
+        }
+        relayed += n as u64;
+    }
+
+    let _ = dst_channel.eof();
+    src_channel.wait_close().ok();
+    dst_channel.wait_close().ok();
+
+    (relayed, batch.len())
+}
+
+// ── Shared tar builder ────────────────────────────────────────────────
+
+fn build_tar(batch: &[FileEntry], config: &TransferConfig) -> Vec<u8> {
+    let total_size: u64 = batch.iter().map(|e| e.size).sum();
     let mut tar_data = Vec::with_capacity(total_size as usize + total_size as usize / 4);
 
     {
@@ -198,7 +553,8 @@ fn send_tar_batch(
                 );
                 header.set_mode(meta.permissions().mode());
                 header.set_entry_type(tar::EntryType::Regular);
-                let _ = tar_builder.append_data(&mut header, &entry.rel, std::io::Cursor::new(&data));
+                let _ =
+                    tar_builder.append_data(&mut header, &entry.rel, std::io::Cursor::new(&data));
             }
         }
 
@@ -209,31 +565,5 @@ fn send_tar_batch(
         tar_data = zstd::encode_all(&tar_data[..], config.zstd_level).unwrap_or(tar_data);
     }
 
-    let cmd = if config.compress_zstd {
-        format!(
-            "zstd -d 2>/dev/null | tar xf - --no-same-owner --no-same-permissions -C {}",
-            shlex::quote(remote_root)
-        )
-    } else {
-        format!(
-            "tar xf - --no-same-owner --no-same-permissions -C {}",
-            shlex::quote(remote_root)
-        )
-    };
-
-    match ssh.open_channel() {
-        Ok(mut channel) => {
-            if channel.exec(&cmd).is_err() {
-                return (0, 0);
-            }
-            let _ = channel.write_all(&tar_data);
-            let _ = channel.eof();
-            channel.wait_close().ok();
-            (tar_data.len() as u64, total_files)
-        }
-        Err(e) => {
-            eprintln!("  channel error: {}", e);
-            (0, 0)
-        }
-    }
+    tar_data
 }
