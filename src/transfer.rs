@@ -21,41 +21,31 @@ pub enum WorkerMsg { Chunk { id: usize, bytes: u64, done: usize, total: usize },
 
 // ── Copy a single file via SFTP with chunked progress ───────────────
 
-fn send_one_via_sftp(
-    entry: &FileEntry, ssh: &Arc<Mutex<SSHConnection>>, rpath: &str, id: usize,
+fn send_file(
+    entry: &FileEntry, ssh: &mut SSHConnection, rpath: &str, id: usize,
     rt: &crossbeam_channel::Sender<WorkerMsg>,
 ) -> (u64, usize) {
     let remote = format!("{}/{}", rpath, entry.rel);
     if let Some(parent) = Path::new(&remote).parent() {
-        let _ = ssh.lock().unwrap().mkdir_p(&parent.to_string_lossy());
+        let _ = ssh.mkdir_p(&parent.to_string_lossy());
     }
 
     let chunks = ((entry.size + (64 << 20) - 1) / (64 << 20)) as usize;
 
-    match ssh.lock().unwrap().open_sftp() {
-        Ok(sftp) => {
-            match sftp.create(&Path::new(&remote)) {
-                Ok(mut rf) => {
-                    match File::open(&entry.src) {
-                        Ok(mut lf) => {
-                            let mut buf = vec![0u8; (64 << 20) as usize];
-                            let mut sent = 0u64;
-                            let mut idx = 0usize;
-                            loop {
-                                let n = match lf.read(&mut buf) { Ok(0) => break, Ok(n) => n, Err(_) => break };
-                                if rf.write_all(&buf[..n]).is_err() { break; }
-                                sent += n as u64; idx += 1;
-                                let _ = rt.send(WorkerMsg::Chunk { id, bytes: n as u64, done: idx, total: chunks });
-                            }
-                            return (sent, 1);
-                        }
-                        Err(e) => eprintln!("\n  W{} open local: {}", id, e),
-                    }
+    if let Ok(sftp) = ssh.open_sftp() {
+        if let Ok(mut rf) = sftp.create(&Path::new(&remote)) {
+            if let Ok(mut lf) = File::open(&entry.src) {
+                let mut buf = vec![0u8; (64 << 20) as usize];
+                let mut sent = 0u64; let mut idx = 0usize;
+                loop {
+                    let n = match lf.read(&mut buf) { Ok(0) => break, Ok(n) => n, Err(_) => break };
+                    if rf.write_all(&buf[..n]).is_err() { break; }
+                    sent += n as u64; idx += 1;
+                    let _ = rt.send(WorkerMsg::Chunk { id, bytes: n as u64, done: idx, total: chunks });
                 }
-                Err(e) => eprintln!("\n  W{} create remote: {}", id, e),
+                return (sent, 1);
             }
         }
-        Err(e) => eprintln!("\n  W{} sftp: {}", id, e),
     }
     (0, 0)
 }
@@ -88,16 +78,25 @@ pub fn copy_remote_parallel(
     for _ in 0..config.workers { jt.send(Vec::new()).ok(); }
 
     let rpath = remote_root.to_string(); let cfg = config.clone(); let nw = config.workers;
+    let spec = ssh.lock().unwrap().spec.clone();
+    drop(ssh); // release lock — workers create their own connections
+
     let mut handles = Vec::new();
     for id in 0..nw {
-        let (jr, rt, rpath, cfg, ssh) = (jr.clone(), rt.clone(), rpath.clone(), cfg.clone(), ssh.clone());
+        let (jr, rt, rpath, cfg, spec) = (jr.clone(), rt.clone(), rpath.clone(), cfg.clone(), spec.clone());
         handles.push(std::thread::spawn(move || {
+            let mut my_ssh = crate::ssh::SSHConnection::new(spec, false);
+            if let Err(e) = my_ssh.connect() {
+                eprintln!("  W{} SSH fail: {}", id, e);
+                let _ = rt.send(WorkerMsg::Done { id, bytes: 0, files: 0 });
+                return;
+            }
             let mut total = (0u64, 0usize);
             loop {
                 let b = match jr.recv() { Ok(b) => b, Err(_) => break };
                 if b.is_empty() { break; }
                 for entry in &b {
-                    let r = send_one_via_sftp(entry, &ssh, &rpath, id, &rt);
+                    let r = send_file(entry, &mut my_ssh, &rpath, id, &rt);
                     total.0 += r.0; total.1 += r.1;
                 }
             }
