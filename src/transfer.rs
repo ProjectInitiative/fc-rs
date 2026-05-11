@@ -1,8 +1,6 @@
-use std::borrow::Cow;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::sync::{Arc, Mutex};
+use std::path::Path;
 use std::time::Instant;
 
 use crossbeam_channel::unbounded;
@@ -10,103 +8,153 @@ use crossbeam_channel::unbounded;
 use crate::progress::{self, Progress};
 use crate::ssh::SSHConnection;
 use crate::types::{FileEntry, RemoteSpec, SMALL_FILE_THRESHOLD};
-use std::path::Path;
-
-fn shq(s: &str) -> Cow<'_, str> { shlex::try_quote(s).unwrap_or(Cow::Borrowed(s)) }
 
 #[derive(Clone)]
 pub struct TransferConfig { pub workers: usize, pub compress_zstd: bool, pub zstd_level: i32, pub buf_size: usize }
+
 #[derive(Clone, Debug)]
-pub enum WorkerMsg { Chunk { id: usize, bytes: u64, done: usize, total: usize }, Done { id: usize, bytes: u64, files: usize } }
-
-// ── Copy a single file via SFTP with chunked progress ───────────────
-
-fn send_file(
-    entry: &FileEntry, ssh: &mut SSHConnection, rpath: &str, id: usize,
-    rt: &crossbeam_channel::Sender<WorkerMsg>,
-) -> (u64, usize) {
-    let remote = format!("{}/{}", rpath, entry.rel);
-    if let Some(parent) = Path::new(&remote).parent() {
-        let _ = ssh.mkdir_p(&parent.to_string_lossy());
-    }
-
-    let chunks = ((entry.size + (64 << 20) - 1) / (64 << 20)) as usize;
-
-    if let Ok(sftp) = ssh.open_sftp() {
-        if let Ok(mut rf) = sftp.create(&Path::new(&remote)) {
-            if let Ok(mut lf) = File::open(&entry.src) {
-                let mut buf = vec![0u8; (64 << 20) as usize];
-                let mut sent = 0u64; let mut idx = 0usize;
-                loop {
-                    let n = match lf.read(&mut buf) { Ok(0) => break, Ok(n) => n, Err(_) => break };
-                    if rf.write_all(&buf[..n]).is_err() { break; }
-                    sent += n as u64; idx += 1;
-                    let _ = rt.send(WorkerMsg::Chunk { id, bytes: n as u64, done: idx, total: chunks });
-                }
-                return (sent, 1);
-            }
-        }
-    }
-    (0, 0)
+pub enum WorkerMsg {
+    Chunk { id: usize, bytes: u64, done: usize, total: usize },
+    Done { id: usize, bytes: u64, files: usize },
 }
+
+const CHUNK: u64 = 64 << 20;
 
 // ── TransferPlanner ──────────────────────────────────────────────────
 
 pub struct TransferPlanner { pub jobs: Vec<Vec<FileEntry>> }
 impl TransferPlanner {
-    pub fn new(entries: &[FileEntry], _nworkers: usize) -> Self {
-        // Each file becomes its own job — send_one_via_sftp handles size-based chunking
+    pub fn new(entries: &[FileEntry]) -> Self {
+        let mut big = Vec::new(); let mut sml = Vec::new();
+        for e in entries {
+            if e.size >= SMALL_FILE_THRESHOLD { big.push(e.clone()); } else { sml.push(e.clone()); }
+        }
+        big.sort_by(|a, b| b.size.cmp(&a.size));
         let mut jobs: Vec<Vec<FileEntry>> = Vec::new();
-        for e in entries { jobs.push(vec![e.clone()]); }
+        for e in big { jobs.push(vec![e]); }
+        let mut cur = Vec::new(); let mut sz = 0u64;
+        for e in sml {
+            if sz + e.size > CHUNK && !cur.is_empty() { jobs.push(std::mem::take(&mut cur)); sz = 0; }
+            sz += e.size; cur.push(e);
+        }
+        if !cur.is_empty() { jobs.push(cur); }
         TransferPlanner { jobs }
     }
 }
 
-// ── Main copy function ───────────────────────────────────────────────
+// ── Shared worker body ──────────────────────────────────────────────
 
-pub fn copy_remote_parallel(
-    entries: &[FileEntry], remote_root: &str,
-    _progress: &Progress, config: &TransferConfig,
-    ssh: &Arc<Mutex<SSHConnection>>,
+fn worker_main(
+    jr: crossbeam_channel::Receiver<Vec<FileEntry>>,
+    rt: crossbeam_channel::Sender<WorkerMsg>,
+    id: usize, spec: RemoteSpec, rpath: String,
+    mkdir: bool,
+    process: impl Fn(&[FileEntry], &mut SSHConnection, usize, &crossbeam_channel::Sender<WorkerMsg>, &str) + Send + 'static,
 ) {
-    let jobs = TransferPlanner::new(entries, config.workers).jobs;
-    if jobs.is_empty() { return; }
+    let mut ssh = SSHConnection::new(spec, false);
+    if let Err(e) = ssh.connect() {
+        eprintln!("  W{} SSH: {}", id, e);
+        let _ = rt.send(WorkerMsg::Done { id, bytes: 0, files: 0 }); return;
+    }
+    if mkdir { let _ = ssh.mkdir_p(&rpath); }
+    let mut total = (0u64, 0usize);
+    loop {
+        let b = match jr.recv() { Ok(b) => b, Err(_) => break };
+        if b.is_empty() { break; }
+        process(&b, &mut ssh, id, &rt, &rpath);
+        for e in &b { total.0 += e.size; total.1 += 1; }
+    }
+    let _ = rt.send(WorkerMsg::Done { id, bytes: total.0, files: total.1 });
+}
 
-    let (jt, jr) = unbounded();
-    let (rt, rr) = unbounded::<WorkerMsg>();
-    for job in jobs { jt.send(job).ok(); }
-    for _ in 0..config.workers { jt.send(Vec::new()).ok(); }
+// ── File transfer helpers ───────────────────────────────────────────
 
-    let rpath = remote_root.to_string(); let cfg = config.clone(); let nw = config.workers;
-    let spec = ssh.lock().unwrap().spec.clone();
-    drop(ssh); // release lock — workers create their own connections
-
-    let mut handles = Vec::new();
-    for id in 0..nw {
-        let (jr, rt, rpath, cfg, spec) = (jr.clone(), rt.clone(), rpath.clone(), cfg.clone(), spec.clone());
-        handles.push(std::thread::spawn(move || {
-            let mut my_ssh = crate::ssh::SSHConnection::new(spec, false);
-            if let Err(e) = my_ssh.connect() {
-                eprintln!("  W{} SSH fail: {}", id, e);
-                let _ = rt.send(WorkerMsg::Done { id, bytes: 0, files: 0 });
-                return;
-            }
-            let mut total = (0u64, 0usize);
-            loop {
-                let b = match jr.recv() { Ok(b) => b, Err(_) => break };
-                if b.is_empty() { break; }
-                for entry in &b {
-                    let r = send_file(entry, &mut my_ssh, &rpath, id, &rt);
-                    total.0 += r.0; total.1 += r.1;
+fn push_file(
+    entry: &FileEntry, ssh: &mut SSHConnection, rpath: &str,
+    id: usize, rt: &crossbeam_channel::Sender<WorkerMsg>,
+) {
+    let remote = format!("{}/{}", rpath, entry.rel);
+    if let Some(p) = Path::new(&remote).parent() { let _ = ssh.mkdir_p(&p.to_string_lossy()); }
+    let nchunks = ((entry.size + CHUNK - 1) / CHUNK) as usize;
+    if let Ok(sftp) = ssh.open_sftp() {
+        if let Ok(mut rf) = sftp.create(&Path::new(&remote)) {
+            if let Ok(mut lf) = File::open(&entry.src) {
+                let mut buf = vec![0u8; CHUNK as usize];
+                let mut idx = 0usize;
+                loop {
+                    let n = match lf.read(&mut buf) { Ok(0) => break, Ok(n) => n, Err(_) => break };
+                    if rf.write_all(&buf[..n]).is_err() { break; }
+                    idx += 1;
+                    let _ = rt.send(WorkerMsg::Chunk { id, bytes: n as u64, done: idx, total: nchunks });
                 }
             }
-            let _ = rt.send(WorkerMsg::Done { id, bytes: total.0, files: total.1 });
-        }));
+        }
     }
+}
 
+fn pull_file(
+    entry: &FileEntry, ssh: &mut SSHConnection, dst_root: &str,
+    id: usize, rt: &crossbeam_channel::Sender<WorkerMsg>,
+) {
+    let local = Path::new(dst_root).join(&entry.rel);
+    if let Some(p) = local.parent() { let _ = std::fs::create_dir_all(p); }
+    let nchunks = ((entry.size + CHUNK - 1) / CHUNK) as usize;
+    if let Ok(sftp) = ssh.open_sftp() {
+        if let Ok(mut rf) = sftp.open(&Path::new(&entry.src)) {
+            if let Ok(mut lf) = File::create(&local) {
+                let mut buf = vec![0u8; CHUNK as usize];
+                let mut idx = 0usize;
+                loop {
+                    let n = match rf.read(&mut buf) { Ok(0) => break, Ok(n) => n, Err(_) => break };
+                    if lf.write_all(&buf[..n]).is_err() { break; }
+                    idx += 1;
+                    let _ = rt.send(WorkerMsg::Chunk { id, bytes: n as u64, done: idx, total: nchunks });
+                }
+            }
+        }
+    }
+}
+
+// ── Orchestrators ───────────────────────────────────────────────────
+
+fn launch(
+    entries: &[FileEntry], cfg: &TransferConfig, spec: &RemoteSpec, rpath: String, mkdir: bool,
+    process: impl Fn(&[FileEntry], &mut SSHConnection, usize, &crossbeam_channel::Sender<WorkerMsg>, &str) + Clone + Send + 'static,
+) {
+    let jobs = TransferPlanner::new(entries).jobs;
+    if jobs.is_empty() { return; }
+    let (jt, jr) = unbounded();
+    let (rt, rr) = unbounded::<WorkerMsg>();
+    for j in jobs { jt.send(j).ok(); }
+    for _ in 0..cfg.workers { jt.send(Vec::new()).ok(); }
+    let spec = spec.clone(); let nw = cfg.workers;
+    let handles: Vec<_> = (0..nw).map(|id| {
+        let (jr, rt, spec, rpath, p) = (jr.clone(), rt.clone(), spec.clone(), rpath.clone(), process.clone());
+        std::thread::spawn(move || worker_main(jr, rt, id, spec, rpath, mkdir, p))
+    }).collect();
     render_loop(&rr, nw);
-    for h in handles { h.join().ok(); }
-    eprintln!();
+    for h in handles { h.join().ok(); } eprintln!();
+}
+
+pub fn copy_remote_parallel(
+    entries: &[FileEntry], rpath: &str, _p: &Progress, c: &TransferConfig, spec: &RemoteSpec,
+) {
+    launch(entries, c, spec, rpath.to_string(), true,
+        |batch, ssh, id, rt, rp| { for e in batch { push_file(e, ssh, rp, id, rt); } });
+}
+
+pub fn copy_remote_pull_parallel(
+    entries: &[FileEntry], spec: &RemoteSpec, _src_root: &str, dst_root: &Path, _p: &Progress, c: &TransferConfig,
+) {
+    launch(entries, c, spec, dst_root.to_string_lossy().to_string(), false,
+        |batch, ssh, id, rt, rp| { for e in batch { pull_file(e, ssh, rp, id, rt); } });
+}
+
+pub fn copy_remote_relay_parallel(
+    entries: &[FileEntry], _src_spec: &RemoteSpec, _dst_spec: &RemoteSpec, _src_root: &str, _dst_root: &str, _p: &Progress, c: &TransferConfig,
+) {
+    launch(entries, c, _src_spec, String::new(), false,
+        |_, _, _, _, _| eprintln!("relay stub"));
 }
 
 // ── Render loop ──────────────────────────────────────────────────────
@@ -145,12 +193,4 @@ fn render(done: &[usize], total: &[usize], bytes: u64, start: &Instant) {
     use std::io::Write as IoWrite;
     let _ = write!(std::io::stderr(), "\r  {}  {}  {}/s  {}", line, progress::fmt_size(bytes), progress::fmt_size_f64(speed), progress::fmt_time(elapsed as u64));
     let _ = std::io::stderr().flush();
-}
-
-// Stubs — pull/relay not ported
-pub fn copy_remote_pull_parallel(_e: &[FileEntry], _s: &RemoteSpec, _sr: &str, _dr: &Path, _p: &Progress, _c: &TransferConfig) {
-    eprintln!("  Pull parallel not implemented, using single-stream");
-}
-pub fn copy_remote_relay_parallel(_e: &[FileEntry], _ss: &RemoteSpec, _ds: &RemoteSpec, _sr: &str, _dr: &str, _p: &Progress, _c: &TransferConfig) {
-    eprintln!("  Relay parallel not implemented, using single-stream");
 }
