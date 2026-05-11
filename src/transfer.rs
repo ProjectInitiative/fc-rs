@@ -54,19 +54,26 @@ fn push_file(
     let remote = format!("{}/{}", rpath, entry.rel);
     if let Some(p) = Path::new(&remote).parent() { let _ = ssh.mkdir_p(&p.to_string_lossy()); }
     let nchunks = ((entry.size + CHUNK - 1) / CHUNK) as usize;
-    if let Ok(sftp) = ssh.open_sftp() {
-        if let Ok(mut rf) = sftp.create(&Path::new(&remote)) {
-            if let Ok(mut lf) = File::open(&entry.src) {
-                let mut buf = vec![0u8; CHUNK as usize];
-                let mut idx = 0usize;
-                loop {
-                    let n = match lf.read(&mut buf) { Ok(0) => break, Ok(n) => n, Err(_) => break };
-                    if rf.write_all(&buf[..n]).is_err() { break; }
-                    idx += 1;
-                    let _ = rt.send(WorkerMsg::Chunk { id, bytes: n as u64, done: idx, total: nchunks });
+    let sftp = match ssh.open_sftp() {
+        Ok(s) => s, Err(e) => { eprintln!("\n  W{} sftp open: {}", id, e); return; }
+    };
+    match sftp.create(&Path::new(&remote)) {
+        Ok(mut rf) => {
+            match File::open(&entry.src) {
+                Ok(mut lf) => {
+                    let mut buf = vec![0u8; CHUNK as usize];
+                    let mut idx = 0usize;
+                    loop {
+                        let n = match lf.read(&mut buf) { Ok(0) => break, Ok(n) => n, Err(_) => break };
+                        if rf.write_all(&buf[..n]).is_err() { break; }
+                        idx += 1;
+                        let _ = rt.send(WorkerMsg::Chunk { id, bytes: n as u64, done: idx, total: nchunks });
+                    }
                 }
+                Err(e) => eprintln!("\n  W{} open local {}: {}", id, entry.src, e),
             }
         }
+        Err(e) => eprintln!("\n  W{} create remote {}: {}", id, remote, e),
     }
 }
 
@@ -122,7 +129,8 @@ fn launch(
         std::thread::spawn(move || {
             let mut ssh = SSHConnection::new(spec, false);
             if let Err(e) = ssh.connect() {
-                eprintln!("  W{} SSH: {}", id, e); let _ = rt.send(WorkerMsg::Done { id, bytes: 0, files: 0 }); return;
+                eprintln!("  W{} SSH fail: {}", id, e);
+                let _ = rt.send(WorkerMsg::Done { id, bytes: 0, files: 0 }); return;
             }
             if mkdir { let _ = ssh.mkdir_p(&rp); }
             let mut total = (0u64, 0usize);
