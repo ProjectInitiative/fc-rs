@@ -97,29 +97,27 @@ fn stream_tar(chunk: &[FileEntry], channel: ssh2::Channel, compress: bool, level
 
 // ── Send chunks with per-worker progress ─────────────────────────────
 
-fn send_work(
-    jobs: Vec<Vec<FileEntry>>, ssh: &mut SSHConnection, rroot: &str, cfg: &TransferConfig,
+fn send_batch(
+    batch: &[FileEntry], ssh: &mut SSHConnection, rroot: &str, cfg: &TransferConfig,
     id: usize, tx: &crossbeam_channel::Sender<WorkerMsg>,
 ) -> (u64, usize) {
     let mut total_b = 0u64; let mut total_f = 0usize;
-    for batch in &jobs {
-        let nchunks = estimate_chunks(batch, MAX_CHUNK);
-        let mut pos = 0usize; let mut idx = 0usize;
-        while pos < batch.len() {
-            let end = next_pos(batch, pos);
-            let chunk = &batch[pos..end]; pos = end; idx += 1;
-            let cmd = if cfg.compress_zstd {
-                format!("zstd -d 2>/dev/null | tar xf - --no-same-owner --no-same-permissions -C {}", shq(rroot))
-            } else {
-                format!("tar xf - --no-same-owner --no-same-permissions -C {}", shq(rroot))
-            };
-            if let Ok(mut ch) = ssh.open_channel() {
-                if ch.exec(&cmd).is_err() { break; }
-                if let Ok((mut ch, b)) = stream_tar(chunk, ch, cfg.compress_zstd, cfg.zstd_level) {
-                    let _ = ch.eof(); ch.wait_close().ok();
-                    total_b += b; total_f += chunk.len();
-                    let _ = tx.send(WorkerMsg::Chunk { id, bytes: b, done: idx, total: nchunks });
-                }
+    let nchunks = estimate_chunks(batch, MAX_CHUNK);
+    let mut pos = 0usize; let mut idx = 0usize;
+    while pos < batch.len() {
+        let end = next_pos(batch, pos);
+        let chunk = &batch[pos..end]; pos = end; idx += 1;
+        let cmd = if cfg.compress_zstd {
+            format!("zstd -d 2>/dev/null | tar xf - --no-same-owner --no-same-permissions -C {}", shq(rroot))
+        } else {
+            format!("tar xf - --no-same-owner --no-same-permissions -C {}", shq(rroot))
+        };
+        if let Ok(mut ch) = ssh.open_channel() {
+            if ch.exec(&cmd).is_err() { break; }
+            if let Ok((mut ch, b)) = stream_tar(chunk, ch, cfg.compress_zstd, cfg.zstd_level) {
+                let _ = ch.eof(); ch.wait_close().ok();
+                total_b += b; total_f += chunk.len();
+                let _ = tx.send(WorkerMsg::Chunk { id, bytes: b, done: idx, total: nchunks });
             }
         }
     }
@@ -142,6 +140,7 @@ fn estimate_chunks(batch: &[FileEntry], max: u64) -> usize {
 
 fn render_loop(rr: &crossbeam_channel::Receiver<WorkerMsg>, nworkers: usize) {
     let start = Instant::now();
+    render(&vec![0; nworkers], &vec![1; nworkers], 0, &start);
     let mut total_bytes = 0u64;
     let mut w_done = vec![0usize; nworkers];
     let mut w_total = vec![0usize; nworkers];
@@ -174,8 +173,9 @@ fn render(done: &[usize], total: &[usize], bytes: u64, start: &Instant) {
         if !line.is_empty() { line.push_str("  "); }
         if total[i] > 0 { line.push_str(&format!("W{}:{}/{}", i, done[i], total[i])); }
     }
-    use std::io::Write as IoWrite;
-    let _ = write!(std::io::stderr(), "\r  {}  {}  {}/s  {}", line, progress::fmt_size(bytes), progress::fmt_size_f64(speed), progress::fmt_time(elapsed as u64));
+    use std::io::{Write as IoWrite, stderr};
+    let _ = write!(stderr(), "\r  {}  {}  {}/s  {}", line, progress::fmt_size(bytes), progress::fmt_size_f64(speed), progress::fmt_time(elapsed as u64));
+    let _ = stderr().flush();
 }
 
 // ── Push mode: local → remote ────────────────────────────────────────
@@ -197,15 +197,19 @@ pub fn copy_remote_parallel(
     let handles: Vec<_> = (0..nw).map(|id| {
         let (jr, rt, spec, rroot, cfg) = (jr.clone(), rt.clone(), spec.clone(), rroot.clone(), cfg.clone());
         std::thread::spawn(move || {
-            let mut ssh = SSHConnection::new(spec, false);
-            if ssh.connect().is_err() { eprintln!("  W{} SSH fail", id); return; }
-            ssh.exec_cmd(&format!("mkdir -p {}", shq(&rroot)), 30000).ok();
             let mut total = (0u64, 0usize);
+            let mut ssh = SSHConnection::new(spec, false);
+            if let Err(e) = ssh.connect() {
+                eprintln!("  W{} SSH fail: {}", id, e);
+                let _ = rt.send(WorkerMsg::Done { id, bytes: 0, files: 0 });
+                return;
+            }
+            ssh.exec_cmd(&format!("mkdir -p {}", shq(&rroot)), 30000).ok();
             loop {
                 match jr.recv() {
                     Ok(b) if b.is_empty() => break,
                     Ok(b) => {
-                        let r = send_work(vec![b], &mut ssh, &rroot, &cfg, id, &rt);
+                        let r = send_batch(&b, &mut ssh, &rroot, &cfg, id, &rt);
                         total.0 += r.0; total.1 += r.1;
                     }
                     Err(_) => break,
