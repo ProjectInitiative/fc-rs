@@ -240,29 +240,50 @@ pub fn copy_remote_relay_parallel(
 
 // ── Push: build tar locally, send over SSH ────────────────────────────
 
+const MAX_BATCH_BYTES: u64 = 64 * 1024 * 1024;  // 64 MB per tar batch
+
 fn send_tar_batch(
     batch: &[FileEntry], ssh: &mut SSHConnection, remote_root: &str, config: &TransferConfig,
 ) -> (u64, usize) {
     if batch.is_empty() { return (0, 0); }
-    let tar_data = build_tar(batch, config);
-    if tar_data.is_empty() { return (0, 0); }
+    let mut total_bytes = 0u64;
+    let mut total_files = 0usize;
+    let mut chunk_start = 0usize;
 
-    let cmd = if config.compress_zstd {
-        format!("zstd -d 2>/dev/null | tar xf - --no-same-owner --no-same-permissions -C {}", shq(remote_root))
-    } else {
-        format!("tar xf - --no-same-owner --no-same-permissions -C {}", shq(remote_root))
-    };
-
-    match ssh.open_channel() {
-        Ok(mut channel) => {
-            if channel.exec(&cmd).is_err() { return (0, 0); }
-            let _ = channel.write_all(&tar_data);
-            let _ = channel.eof();
-            channel.wait_close().ok();
-            (tar_data.len() as u64, batch.len())
+    while chunk_start < batch.len() {
+        let mut chunk_end = chunk_start;
+        let mut chunk_size = 0u64;
+        while chunk_end < batch.len() && chunk_size < MAX_BATCH_BYTES {
+            chunk_size += batch[chunk_end].size;
+            chunk_end += 1;
         }
-        Err(e) => { eprintln!("  channel error: {}", e); (0, 0) }
+        if chunk_end == chunk_start { chunk_end = chunk_start + 1; }
+
+        let chunk = &batch[chunk_start..chunk_end];
+        chunk_start = chunk_end;
+
+        let tar_data = build_tar(chunk, config);
+        if tar_data.is_empty() { continue; }
+
+        let cmd = if config.compress_zstd {
+            format!("zstd -d 2>/dev/null | tar xf - --no-same-owner --no-same-permissions -C {}", shq(remote_root))
+        } else {
+            format!("tar xf - --no-same-owner --no-same-permissions -C {}", shq(remote_root))
+        };
+
+        match ssh.open_channel() {
+            Ok(mut channel) => {
+                if channel.exec(&cmd).is_err() { break; }
+                let _ = channel.write_all(&tar_data);
+                let _ = channel.eof();
+                channel.wait_close().ok();
+                total_bytes += tar_data.len() as u64;
+                total_files += chunk.len();
+            }
+            Err(e) => { eprintln!("  channel error: {}", e); break; }
+        }
     }
+    (total_bytes, total_files)
 }
 
 // ── Pull: exec tar on remote, read stream, extract locally ────────────
@@ -329,7 +350,8 @@ fn relay_tar_batch(
 
 fn build_tar(batch: &[FileEntry], config: &TransferConfig) -> Vec<u8> {
     let total_size: u64 = batch.iter().map(|e| e.size).sum();
-    let mut tar_data = Vec::with_capacity(total_size as usize + total_size as usize / 4);
+    let cap = (total_size as usize).saturating_add(total_size as usize / 4).min(128 * 1024 * 1024);
+    let mut tar_data = Vec::with_capacity(cap);
     {
         let mut tar_builder = tar::Builder::new(std::io::Cursor::new(&mut tar_data));
         for entry in batch {
